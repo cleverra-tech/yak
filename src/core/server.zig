@@ -6,6 +6,9 @@ const ProtocolHandler = @import("../network/protocol.zig").ProtocolHandler;
 const Message = @import("../message.zig").Message;
 const Queue = @import("../routing/queue.zig").Queue;
 const Exchange = @import("../routing/exchange.zig").Exchange;
+const ErrorHandler = @import("../error/error_handler.zig").ErrorHandler;
+const ErrorHelpers = @import("../error/error_handler.zig").ErrorHelpers;
+const RecoveryAction = @import("../error/error_handler.zig").RecoveryAction;
 
 // Global reference to server instance for persistence callback
 var global_server: ?*Server = null;
@@ -14,6 +17,13 @@ fn serverPersistMessage(vhost_name: []const u8, queue_name: []const u8, message:
     if (global_server) |server| {
         try server.persistMessage(vhost_name, queue_name, message);
     }
+}
+
+fn serverHandleError(error_info: @import("../error/error_handler.zig").ErrorInfo) RecoveryAction {
+    if (global_server) |server| {
+        return server.error_handler.handleError(error_info);
+    }
+    return .close_connection; // Default fallback
 }
 
 pub const Server = struct {
@@ -27,6 +37,8 @@ pub const Server = struct {
     cli_server: ?std.net.Server,
     protocol_handler: ProtocolHandler,
     persistence_mutex: std.Thread.Mutex,
+    error_handler: ErrorHandler,
+    shutdown_requested: std.atomic.Value(bool),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Server {
         const protocol_handler = ProtocolHandler.init(allocator);
@@ -42,20 +54,30 @@ pub const Server = struct {
             .cli_server = null,
             .protocol_handler = protocol_handler,
             .persistence_mutex = std.Thread.Mutex{},
+            .error_handler = ErrorHandler.init(allocator),
+            .shutdown_requested = std.atomic.Value(bool).init(false),
         };
 
         // Set up global server reference for persistence callback
         global_server = &server;
-        
+
         // Set up persistence callback in protocol handler
         server.protocol_handler.persist_message_fn = serverPersistMessage;
+        
+        // Set up error handler callback in protocol handler
+        server.protocol_handler.error_handler_fn = serverHandleError;
 
         // Create default virtual host
         try server.createVirtualHost("/");
 
         // Recover persistent state from storage
         server.recoverPersistentState() catch |err| {
-            std.log.warn("Failed to recover persistent state: {}", .{err});
+            const error_info = ErrorHelpers.recoverableError(.resource_error, "Failed to recover persistent state from storage");
+            const action = server.error_handler.handleError(error_info);
+            
+            if (action == .shutdown_server) {
+                return err;
+            }
         };
 
         // Note: Virtual host integration will be handled within the protocol handler
@@ -67,8 +89,11 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         // Clear global reference
         global_server = null;
-        
+
         self.stop();
+
+        // Clean up error handler
+        self.error_handler.deinit();
 
         // Clean up protocol handler
         self.protocol_handler.deinit();
@@ -101,17 +126,27 @@ pub const Server = struct {
         self.running = true;
 
         // Start accepting connections
-        while (self.running) {
-            const client_socket = self.tcp_server.?.accept() catch |err| {
-                std.log.err("Failed to accept connection: {}", .{err});
-                continue;
+        while (self.running and !self.shutdown_requested.load(.monotonic)) {
+            const client_socket = self.tcp_server.?.accept() catch {
+                const error_info = ErrorHelpers.recoverableError(.resource_error, "Failed to accept incoming connection");
+                const action = self.error_handler.handleError(error_info);
+                
+                switch (action) {
+                    .shutdown_server => {
+                        std.log.err("Shutting down server due to connection accept failures");
+                        self.requestShutdown();
+                        break;
+                    },
+                    else => {
+                        // Brief pause before retrying to avoid tight error loop
+                        std.Thread.sleep(100 * std.time.ns_per_ms);
+                        continue;
+                    },
+                }
             };
 
-            // Handle connection in a separate thread (simplified for now)
-            self.handleConnection(client_socket) catch |err| {
-                std.log.err("Failed to handle connection: {}", .{err});
-                client_socket.stream.close();
-            };
+            // Handle connection with comprehensive error recovery
+            self.handleConnectionWithRecovery(client_socket);
         }
     }
 
@@ -126,22 +161,31 @@ pub const Server = struct {
         self.running = true;
 
         // Start accepting connections with shutdown monitoring
-        while (self.running and !shutdown_flag.*) {
+        while (self.running and !shutdown_flag.* and !self.shutdown_requested.load(.monotonic)) {
             // Use accept with timeout to periodically check shutdown flag
             const client_socket = self.acceptWithTimeout(100) catch |err| switch (err) {
                 error.WouldBlock => continue, // Timeout, check shutdown flag
                 else => {
-                    std.log.err("Failed to accept connection: {}", .{err});
-                    continue;
+                    const error_info = ErrorHelpers.recoverableError(.resource_error, "Failed to accept connection with timeout");
+                    const action = self.error_handler.handleError(error_info);
+                    
+                    switch (action) {
+                        .shutdown_server => {
+                            std.log.err("Shutting down server due to persistent connection failures", .{});
+                            self.requestShutdown();
+                            break;
+                        },
+                        else => {
+                            std.Thread.sleep(100 * std.time.ns_per_ms);
+                            continue;
+                        },
+                    }
                 },
             };
 
             if (client_socket) |socket| {
-                // Handle connection in a separate thread (simplified for now)
-                self.handleConnection(socket) catch |err| {
-                    std.log.err("Failed to handle connection: {}", .{err});
-                    socket.stream.close();
-                };
+                // Handle connection with comprehensive error recovery
+                self.handleConnectionWithRecovery(socket);
             }
         }
 
@@ -197,19 +241,75 @@ pub const Server = struct {
         // TODO: Start CLI server in separate thread
     }
 
+    fn handleConnectionWithRecovery(self: *Server, client_socket: std.net.Server.Connection) void {
+        self.handleConnection(client_socket) catch {
+            const error_info = ErrorHelpers.connectionError(.connection_forced, "Failed to initialize connection", 0);
+            const action = self.error_handler.handleError(error_info);
+            
+            switch (action) {
+                .shutdown_server => {
+                    std.log.err("Shutting down server due to critical connection handling failure", .{});
+                    self.requestShutdown();
+                },
+                else => {
+                    // Close the socket and continue
+                    client_socket.stream.close();
+                },
+            }
+        };
+    }
+
     fn handleConnection(self: *Server, client_socket: std.net.Server.Connection) !void {
-        const connection = try self.allocator.create(NetworkConnection);
-        connection.* = try NetworkConnection.init(self.allocator, self.next_connection_id, client_socket.stream);
+        const connection = self.allocator.create(NetworkConnection) catch |err| {
+            const error_info = ErrorHelpers.fatalError(.resource_error, "Failed to allocate memory for connection");
+            const action = self.error_handler.handleError(error_info);
+            
+            if (action == .shutdown_server) {
+                self.requestShutdown();
+                return error.OutOfMemory;
+            }
+            return err;
+        };
+
+        connection.* = NetworkConnection.init(self.allocator, self.next_connection_id, client_socket.stream) catch |err| {
+            self.allocator.destroy(connection);
+            
+            const error_info = ErrorHelpers.connectionError(.connection_forced, "Failed to initialize connection", self.next_connection_id);
+            _ = self.error_handler.handleError(error_info);
+            
+            return err;
+        };
+
+        const connection_id = connection.id;
         self.next_connection_id += 1;
 
-        try self.connections.append(connection);
+        self.connections.append(connection) catch |err| {
+            connection.deinit();
+            self.allocator.destroy(connection);
+            
+            const error_info = ErrorHelpers.fatalError(.resource_error, "Failed to track connection");
+            const action = self.error_handler.handleError(error_info);
+            
+            if (action == .shutdown_server) {
+                self.requestShutdown();
+            }
+            return err;
+        };
 
-        std.log.info("New connection established: {}", .{connection.id});
+        std.log.info("New connection established: {}", .{connection_id});
 
-        // Use protocol handler for connection management
+        // Use protocol handler for connection management with error recovery
         self.protocol_handler.handleConnection(connection) catch |err| {
-            std.log.err("Protocol handling failed for connection {}: {}", .{ connection.id, err });
+            const error_info = ErrorHelpers.connectionError(.connection_forced, "Protocol handling failed", connection_id);
+            const action = self.error_handler.handleError(error_info);
+            
+            switch (action) {
+                .shutdown_server => self.requestShutdown(),
+                else => {}, // Connection will be cleaned up by removeConnection
+            }
+            
             self.removeConnection(connection);
+            return err;
         };
     }
 
@@ -246,6 +346,17 @@ pub const Server = struct {
         return @intCast(self.vhosts.count());
     }
 
+    /// Request graceful shutdown 
+    pub fn requestShutdown(self: *Server) void {
+        self.shutdown_requested.store(true, .monotonic);
+        std.log.info("Graceful shutdown requested", .{});
+    }
+
+    /// Check if shutdown has been requested
+    pub fn isShutdownRequested(self: *const Server) bool {
+        return self.shutdown_requested.load(.monotonic);
+    }
+
     // Metrics and statistics
     pub fn getStats(self: *const Server, allocator: std.mem.Allocator) !std.json.Value {
         var stats = std.json.ObjectMap.init(allocator);
@@ -253,13 +364,18 @@ pub const Server = struct {
         try stats.put("connections", std.json.Value{ .integer = @intCast(self.connections.items.len) });
         try stats.put("virtual_hosts", std.json.Value{ .integer = @intCast(self.vhosts.count()) });
         try stats.put("running", std.json.Value{ .bool = self.running });
+        try stats.put("shutdown_requested", std.json.Value{ .bool = self.shutdown_requested.load(.monotonic) });
+
+        // Include error statistics
+        const error_stats = try self.error_handler.getErrorStats(allocator);
+        try stats.put("errors", error_stats);
 
         return std.json.Value{ .object = stats };
     }
 
     fn recoverPersistentState(self: *Server) !void {
         const persistence_dir = "./yak_persistence";
-        
+
         // Ensure persistence directory exists
         std.fs.cwd().makeDir(persistence_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
@@ -276,7 +392,6 @@ pub const Server = struct {
     }
 
     fn recoverVirtualHost(self: *Server, vhost: *VirtualHost, persistence_dir: []const u8) !void {
-        
         const vhost_dir = try std.fmt.allocPrint(self.allocator, "{s}/vhost_{s}", .{ persistence_dir, vhost.name });
         defer self.allocator.free(vhost_dir);
 
@@ -324,22 +439,22 @@ pub const Server = struct {
         // Parse message count from file header
         if (file_data.len < 4) return;
         const message_count = std.mem.readInt(u32, file_data[0..4], .little);
-        
+
         var offset: usize = 4;
         var recovered_count: u32 = 0;
 
         for (0..message_count) |_| {
             if (offset >= file_data.len) break;
-            
+
             // Read message size
             if (offset + 4 > file_data.len) break;
-            const message_size = std.mem.readInt(u32, file_data[offset..offset + 4][0..4], .little);
+            const message_size = std.mem.readInt(u32, file_data[offset .. offset + 4][0..4], .little);
             offset += 4;
 
             if (offset + message_size > file_data.len) break;
-            
+
             // Deserialize message
-            const message_data = file_data[offset..offset + message_size];
+            const message_data = file_data[offset .. offset + message_size];
             var message = Message.decodeFromStorage(message_data, self.allocator) catch |err| {
                 std.log.warn("Failed to decode persistent message: {}", .{err});
                 offset += message_size;
@@ -347,11 +462,12 @@ pub const Server = struct {
             };
 
             // Add message to queue
-            queue.publish(message) catch |err| {
-                std.log.warn("Failed to restore message to queue {s}: {}", .{ queue.name, err });
+            queue.publish(message) catch {
+                const error_info = ErrorHelpers.recoverableError(.resource_error, "Failed to restore persistent message to queue");
+                _ = self.error_handler.handleError(error_info);
                 message.deinit();
             };
-            
+
             recovered_count += 1;
             offset += message_size;
         }
@@ -454,7 +570,7 @@ pub const Server = struct {
             if (message.persistent) {
                 const encoded = try message.encodeForStorage(self.allocator);
                 defer self.allocator.free(encoded);
-                
+
                 std.mem.writeInt(u32, &buffer, @intCast(encoded.len), .little);
                 try file.writeAll(&buffer);
                 try file.writeAll(encoded);
@@ -462,6 +578,14 @@ pub const Server = struct {
         }
 
         std.log.debug("Persisted {} messages for durable queue {s} in vhost {s}", .{ persistent_count, queue.name, vhost_name });
+    }
+
+    /// Periodic maintenance for error handler
+    pub fn performMaintenance(self: *Server) void {
+        // Clear old errors (older than 1 hour)
+        self.error_handler.clearOldErrors(3600);
+        
+        std.log.debug("Performed server maintenance: cleared old errors", .{});
     }
 };
 

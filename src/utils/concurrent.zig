@@ -368,7 +368,7 @@ test "thread pool basic operations" {
     try pool.submit(TestData.workFunc, null);
 
     // Give threads time to process
-    std.time.sleep(100 * std.time.ns_per_ms);
+    std.Thread.sleep(100 * std.time.ns_per_ms);
 
     TestData.mutex.lock();
     const final_counter = TestData.counter;

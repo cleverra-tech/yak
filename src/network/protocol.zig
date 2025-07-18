@@ -10,6 +10,9 @@ const BasicProperties = @import("../protocol/methods.zig").BasicProperties;
 const VirtualHost = @import("../core/vhost.zig").VirtualHost;
 const ExchangeType = @import("../routing/exchange.zig").ExchangeType;
 const Message = @import("../message.zig").Message;
+const ErrorHandler = @import("../error/error_handler.zig").ErrorHandler;
+const ErrorHelpers = @import("../error/error_handler.zig").ErrorHelpers;
+const RecoveryAction = @import("../error/error_handler.zig").RecoveryAction;
 
 // Structure to track messages in progress (Basic.Publish -> Content Header -> Content Body)
 const PendingMessage = struct {
@@ -48,6 +51,7 @@ pub const ProtocolHandler = struct {
     server_properties: std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     get_vhost_fn: ?*const fn (vhost_name: []const u8) ?*VirtualHost,
     persist_message_fn: ?*const fn (vhost_name: []const u8, queue_name: []const u8, message: *const Message) anyerror!void,
+    error_handler_fn: ?*const fn (error_info: @import("../error/error_handler.zig").ErrorInfo) RecoveryAction,
     pending_messages: std.HashMap(u64, PendingMessage, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage), // channel_id -> PendingMessage
     next_message_id: std.atomic.Value(u64),
 
@@ -61,6 +65,7 @@ pub const ProtocolHandler = struct {
             .server_properties = std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .get_vhost_fn = null,
             .persist_message_fn = null,
+            .error_handler_fn = null,
             .pending_messages = std.HashMap(u64, PendingMessage, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage).init(allocator),
             .next_message_id = std.atomic.Value(u64).init(1),
             .pending_messages_mutex = std.Thread.Mutex{},
@@ -132,13 +137,44 @@ pub const ProtocolHandler = struct {
         // Main message processing loop
         while (!connection.isClosing()) {
             const frame = connection.receiveFrame() catch |err| {
-                std.log.err("Connection {} frame receive error: {}", .{ connection.id, err });
-                break;
+                const error_info = ErrorHelpers.connectionError(.connection_forced, "Frame receive error", connection.id);
+                if (self.error_handler_fn) |handler_fn| {
+                    const action = handler_fn(error_info);
+                    
+                    switch (action) {
+                        .close_connection, .shutdown_server => break,
+                        else => {
+                            // Brief pause before retrying to avoid tight error loop
+                            std.Thread.sleep(10 * std.time.ns_per_ms);
+                            continue;
+                        },
+                    }
+                } else {
+                    std.log.err("Connection {} frame receive error: {}", .{ connection.id, err });
+                    break;
+                }
             };
 
             if (frame) |f| {
                 defer self.allocator.free(f.payload);
-                try self.handleFrame(connection, f);
+                self.handleFrame(connection, f) catch |err| {
+                    const error_info = ErrorHelpers.connectionError(.unexpected_frame, "Frame handling error", connection.id);
+                    if (self.error_handler_fn) |handler_fn| {
+                        const action = handler_fn(error_info);
+                        
+                        switch (action) {
+                            .close_connection, .shutdown_server => break,
+                            .close_channel => {
+                                // TODO: Send channel close for channel-specific errors
+                                continue;
+                            },
+                            else => continue,
+                        }
+                    } else {
+                        std.log.err("Connection {} frame handling error: {}", .{ connection.id, err });
+                        break;
+                    }
+                };
             } else {
                 // Connection closed by client
                 break;
