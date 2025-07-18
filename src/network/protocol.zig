@@ -5,19 +5,55 @@ const Frame = @import("../protocol/frame.zig").Frame;
 const FrameType = @import("../protocol/frame.zig").FrameType;
 const Method = @import("../protocol/methods.zig").Method;
 const MethodClass = @import("../protocol/methods.zig").MethodClass;
+const ContentHeader = @import("../protocol/methods.zig").ContentHeader;
+const BasicProperties = @import("../protocol/methods.zig").BasicProperties;
 const VirtualHost = @import("../core/vhost.zig").VirtualHost;
 const ExchangeType = @import("../routing/exchange.zig").ExchangeType;
+
+// Structure to track messages in progress (Basic.Publish -> Content Header -> Content Body)
+const PendingMessage = struct {
+    exchange_name: []const u8,
+    routing_key: []const u8,
+    mandatory: bool,
+    immediate: bool,
+    header: ?ContentHeader,
+    body_data: std.ArrayList(u8),
+    expected_body_size: u64,
+    
+    pub fn init(allocator: std.mem.Allocator, exchange_name: []const u8, routing_key: []const u8, mandatory: bool, immediate: bool) !PendingMessage {
+        return PendingMessage{
+            .exchange_name = try allocator.dupe(u8, exchange_name),
+            .routing_key = try allocator.dupe(u8, routing_key),
+            .mandatory = mandatory,
+            .immediate = immediate,
+            .header = null,
+            .body_data = std.ArrayList(u8).init(allocator),
+            .expected_body_size = 0,
+        };
+    }
+    
+    pub fn deinit(self: *PendingMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.exchange_name);
+        allocator.free(self.routing_key);
+        if (self.header) |*header| {
+            header.deinit(allocator);
+        }
+        self.body_data.deinit();
+    }
+};
 
 pub const ProtocolHandler = struct {
     allocator: std.mem.Allocator,
     server_properties: std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     get_vhost_fn: ?*const fn (vhost_name: []const u8) ?*VirtualHost,
+    pending_messages: std.HashMap(u64, PendingMessage, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage), // channel_id -> PendingMessage
 
     pub fn init(allocator: std.mem.Allocator) ProtocolHandler {
         var handler = ProtocolHandler{
             .allocator = allocator,
             .server_properties = std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .get_vhost_fn = null,
+            .pending_messages = std.HashMap(u64, PendingMessage, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage).init(allocator),
         };
 
         // Initialize server properties
@@ -35,6 +71,13 @@ pub const ProtocolHandler = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.server_properties.deinit();
+        
+        // Clean up pending messages
+        var pending_iterator = self.pending_messages.iterator();
+        while (pending_iterator.next()) |entry| {
+            entry.value_ptr.*.deinit(self.allocator);
+        }
+        self.pending_messages.deinit();
     }
 
     pub fn setVirtualHostGetter(self: *ProtocolHandler, get_vhost_fn: *const fn (vhost_name: []const u8) ?*VirtualHost) void {
@@ -1191,7 +1234,7 @@ pub const ProtocolHandler = struct {
     // Basic method implementations
     fn handleBasicQos(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
         _ = self;
-        
+
         // Check if channel exists
         const channel = connection.getChannel(channel_id) orelse {
             std.log.warn("Basic.QoS on non-existent channel {} on connection {}", .{ channel_id, connection.id });
@@ -1282,15 +1325,23 @@ pub const ProtocolHandler = struct {
             return; // Silently drop non-mandatory message
         };
 
-        // TODO: Store message content (will be provided in subsequent content header/body frames)
-        // For now, just validate and log the publish request
+        // Create pending message to track content header and body frames
+        const channel_key = (@as(u64, connection.id) << 16) | channel_id;
+        
+        // Remove any existing pending message for this channel
+        if (self.pending_messages.fetchRemove(channel_key)) |existing| {
+            var existing_msg = existing.value;
+            existing_msg.deinit(self.allocator);
+        }
+        
+        // Create new pending message
+        const pending_message = try PendingMessage.init(self.allocator, exchange_name, routing_key, mandatory, immediate);
+        try self.pending_messages.put(channel_key, pending_message);
         
         // TODO: Handle immediate flag
-        // TODO: Route message through exchange
-        _ = exchange;
-        
-        std.log.debug("Basic.Publish received: exchange={s}, routing_key={s}, mandatory={}, immediate={}", 
-                     .{ exchange_name, routing_key, mandatory, immediate });
+        _ = exchange; // Will be used when routing the complete message
+
+        std.log.debug("Basic.Publish received: exchange={s}, routing_key={s}, mandatory={}, immediate={} - awaiting content", .{ exchange_name, routing_key, mandatory, immediate });
     }
 
     fn handleBasicConsume(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -1358,7 +1409,7 @@ pub const ProtocolHandler = struct {
 
             try response_buf.writer().writeInt(u16, 60, .big); // class=60 (Basic)
             try response_buf.writer().writeInt(u16, 21, .big); // method=21 (ConsumeOk)
-            
+
             // Consumer tag
             try response_buf.writer().writeInt(u8, @intCast(consumer_tag.len), .big);
             try response_buf.appendSlice(consumer_tag);
@@ -1371,17 +1422,15 @@ pub const ProtocolHandler = struct {
             defer self.allocator.free(response_frame.payload);
 
             try connection.sendFrame(response_frame);
-            std.log.debug("Basic.ConsumeOk sent to connection {}, channel {}: consumer_tag={s}", 
-                         .{ connection.id, channel_id, consumer_tag });
+            std.log.debug("Basic.ConsumeOk sent to connection {}, channel {}: consumer_tag={s}", .{ connection.id, channel_id, consumer_tag });
         }
 
-        std.log.debug("Basic.Consume processed: queue={s}, consumer_tag={s}, no_ack={}", 
-                     .{ queue_name, consumer_tag, no_ack });
+        std.log.debug("Basic.Consume processed: queue={s}, consumer_tag={s}, no_ack={}", .{ queue_name, consumer_tag, no_ack });
     }
 
     fn handleBasicAck(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
         _ = self;
-        
+
         // Check if channel exists
         const channel = connection.getChannel(channel_id) orelse {
             std.log.warn("Basic.Ack on non-existent channel {} on connection {}", .{ channel_id, connection.id });
@@ -1408,7 +1457,7 @@ pub const ProtocolHandler = struct {
 
     fn handleBasicNack(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
         _ = self;
-        
+
         // Check if channel exists
         const channel = connection.getChannel(channel_id) orelse {
             std.log.warn("Basic.Nack on non-existent channel {} on connection {}", .{ channel_id, connection.id });
@@ -1497,10 +1546,43 @@ pub const ProtocolHandler = struct {
     }
 
     fn handleHeaderFrame(self: *ProtocolHandler, connection: *Connection, frame: Frame) !void {
-        _ = self;
+        // Check if channel exists
+        const channel = connection.getChannel(frame.channel_id) orelse {
+            std.log.warn("Content header frame on non-existent channel {} on connection {}", .{ frame.channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
 
-        // TODO: Implement content header handling
-        std.log.debug("Header frame not yet implemented: connection={}, channel={}", .{ connection.id, frame.channel_id });
+        if (!channel.active) {
+            return error.ChannelNotActive;
+        }
+
+        // Get pending message for this channel
+        const channel_key = (@as(u64, connection.id) << 16) | frame.channel_id;
+        var pending_message = self.pending_messages.getPtr(channel_key) orelse {
+            std.log.warn("Content header frame without preceding Basic.Publish on channel {} connection {}", .{ frame.channel_id, connection.id });
+            return error.UnexpectedContentHeader;
+        };
+
+        // Parse content header
+        const content_header = try ContentHeader.decode(frame.payload, self.allocator);
+        
+        // Validate class ID (should be 60 for Basic class)
+        if (content_header.class_id != 60) {
+            content_header.deinit(self.allocator);
+            std.log.warn("Content header with invalid class ID {} on channel {} connection {}", .{ content_header.class_id, frame.channel_id, connection.id });
+            return error.InvalidContentHeaderClass;
+        }
+
+        // Store the header and expected body size
+        pending_message.header = content_header;
+        pending_message.expected_body_size = content_header.body_size;
+
+        std.log.debug("Content header received: channel={}, body_size={}, connection={}", .{ frame.channel_id, content_header.body_size, connection.id });
+
+        // If body size is 0, complete the message immediately
+        if (content_header.body_size == 0) {
+            try self.completeMessage(connection, frame.channel_id);
+        }
     }
 
     fn handleBodyFrame(self: *ProtocolHandler, connection: *Connection, frame: Frame) !void {
@@ -1521,6 +1603,40 @@ pub const ProtocolHandler = struct {
         try connection.sendHeartbeat();
 
         std.log.debug("Heartbeat handled for connection {}", .{connection.id});
+    }
+
+    fn completeMessage(self: *ProtocolHandler, connection: *Connection, channel_id: u16) !void {
+        const channel_key = (@as(u64, connection.id) << 16) | channel_id;
+        
+        const pending_entry = self.pending_messages.fetchRemove(channel_key) orelse {
+            std.log.warn("Attempted to complete non-existent pending message on channel {} connection {}", .{ channel_id, connection.id });
+            return error.NoPendingMessage;
+        };
+        var pending_message = pending_entry.value;
+        defer pending_message.deinit(self.allocator);
+        
+        // Get virtual host for message routing
+        const vhost = self.getVirtualHost(connection) orelse {
+            std.log.warn("Cannot complete message on connection {} with no virtual host", .{connection.id});
+            return error.NoVirtualHost;
+        };
+
+        // Get exchange for routing
+        const exchange = vhost.getExchange(pending_message.exchange_name) orelse {
+            std.log.warn("Cannot route message to non-existent exchange '{s}' on connection {}", .{ pending_message.exchange_name, connection.id });
+            if (pending_message.mandatory) {
+                // TODO: Send Basic.Return for mandatory message to non-existent exchange
+                return error.ExchangeNotFound;
+            }
+            return; // Silently drop non-mandatory message
+        };
+
+        // TODO: Create complete message object and route through exchange
+        // For now, just log the completion
+        _ = exchange;
+        
+        std.log.debug("Message completed: exchange={s}, routing_key={s}, body_size={}, channel={}, connection={}", 
+                     .{ pending_message.exchange_name, pending_message.routing_key, pending_message.body_data.items.len, channel_id, connection.id });
     }
 
     fn encodeFieldTable(self: *ProtocolHandler, table: std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage)) ![]u8 {

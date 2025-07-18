@@ -312,6 +312,206 @@ pub const BasicAck = struct {
     }
 };
 
+// AMQP Content Header (Basic Properties)
+pub const BasicProperties = struct {
+    content_type: ?[]const u8,
+    content_encoding: ?[]const u8,
+    headers: ?[]const u8, // Field table
+    delivery_mode: ?u8,
+    priority: ?u8,
+    correlation_id: ?[]const u8,
+    reply_to: ?[]const u8,
+    expiration: ?[]const u8,
+    message_id: ?[]const u8,
+    timestamp: ?u64,
+    type: ?[]const u8,
+    user_id: ?[]const u8,
+    app_id: ?[]const u8,
+    cluster_id: ?[]const u8,
+
+    pub fn decode(data: []const u8, allocator: std.mem.Allocator) !BasicProperties {
+        if (data.len < 2) return error.InvalidBasicProperties;
+
+        var stream = std.io.fixedBufferStream(data);
+        const reader = stream.reader();
+
+        // Read property flags (2 bytes)
+        const property_flags = try reader.readInt(u16, .big);
+
+        var properties = BasicProperties{
+            .content_type = null,
+            .content_encoding = null,
+            .headers = null,
+            .delivery_mode = null,
+            .priority = null,
+            .correlation_id = null,
+            .reply_to = null,
+            .expiration = null,
+            .message_id = null,
+            .timestamp = null,
+            .type = null,
+            .user_id = null,
+            .app_id = null,
+            .cluster_id = null,
+        };
+
+        // Parse properties based on flags
+        if (property_flags & 0x8000 != 0) { // content-type
+            properties.content_type = try readShortString(reader, allocator);
+        }
+        if (property_flags & 0x4000 != 0) { // content-encoding
+            properties.content_encoding = try readShortString(reader, allocator);
+        }
+        if (property_flags & 0x2000 != 0) { // headers (field table)
+            properties.headers = try readFieldTable(reader, allocator);
+        }
+        if (property_flags & 0x1000 != 0) { // delivery-mode
+            properties.delivery_mode = try reader.readByte();
+        }
+        if (property_flags & 0x0800 != 0) { // priority
+            properties.priority = try reader.readByte();
+        }
+        if (property_flags & 0x0400 != 0) { // correlation-id
+            properties.correlation_id = try readShortString(reader, allocator);
+        }
+        if (property_flags & 0x0200 != 0) { // reply-to
+            properties.reply_to = try readShortString(reader, allocator);
+        }
+        if (property_flags & 0x0100 != 0) { // expiration
+            properties.expiration = try readShortString(reader, allocator);
+        }
+        if (property_flags & 0x0080 != 0) { // message-id
+            properties.message_id = try readShortString(reader, allocator);
+        }
+        if (property_flags & 0x0040 != 0) { // timestamp
+            properties.timestamp = try reader.readInt(u64, .big);
+        }
+        if (property_flags & 0x0020 != 0) { // type
+            properties.type = try readShortString(reader, allocator);
+        }
+        if (property_flags & 0x0010 != 0) { // user-id
+            properties.user_id = try readShortString(reader, allocator);
+        }
+        if (property_flags & 0x0008 != 0) { // app-id
+            properties.app_id = try readShortString(reader, allocator);
+        }
+        if (property_flags & 0x0004 != 0) { // cluster-id
+            properties.cluster_id = try readShortString(reader, allocator);
+        }
+
+        return properties;
+    }
+
+    pub fn encode(self: *const BasicProperties, allocator: std.mem.Allocator) ![]u8 {
+        var buffer = std.ArrayList(u8).init(allocator);
+        defer buffer.deinit();
+
+        // Calculate property flags
+        var property_flags: u16 = 0;
+        if (self.content_type != null) property_flags |= 0x8000;
+        if (self.content_encoding != null) property_flags |= 0x4000;
+        if (self.headers != null) property_flags |= 0x2000;
+        if (self.delivery_mode != null) property_flags |= 0x1000;
+        if (self.priority != null) property_flags |= 0x0800;
+        if (self.correlation_id != null) property_flags |= 0x0400;
+        if (self.reply_to != null) property_flags |= 0x0200;
+        if (self.expiration != null) property_flags |= 0x0100;
+        if (self.message_id != null) property_flags |= 0x0080;
+        if (self.timestamp != null) property_flags |= 0x0040;
+        if (self.type != null) property_flags |= 0x0020;
+        if (self.user_id != null) property_flags |= 0x0010;
+        if (self.app_id != null) property_flags |= 0x0008;
+        if (self.cluster_id != null) property_flags |= 0x0004;
+
+        // Write property flags
+        try buffer.writer().writeInt(u16, property_flags, .big);
+
+        // Write properties in order
+        if (self.content_type) |ct| try writeShortString(buffer.writer(), ct);
+        if (self.content_encoding) |ce| try writeShortString(buffer.writer(), ce);
+        if (self.headers) |h| {
+            try buffer.writer().writeInt(u32, @intCast(h.len), .big);
+            try buffer.appendSlice(h);
+        }
+        if (self.delivery_mode) |dm| try buffer.writer().writeByte(dm);
+        if (self.priority) |p| try buffer.writer().writeByte(p);
+        if (self.correlation_id) |ci| try writeShortString(buffer.writer(), ci);
+        if (self.reply_to) |rt| try writeShortString(buffer.writer(), rt);
+        if (self.expiration) |e| try writeShortString(buffer.writer(), e);
+        if (self.message_id) |mi| try writeShortString(buffer.writer(), mi);
+        if (self.timestamp) |ts| try buffer.writer().writeInt(u64, ts, .big);
+        if (self.type) |t| try writeShortString(buffer.writer(), t);
+        if (self.user_id) |ui| try writeShortString(buffer.writer(), ui);
+        if (self.app_id) |ai| try writeShortString(buffer.writer(), ai);
+        if (self.cluster_id) |ci| try writeShortString(buffer.writer(), ci);
+
+        return buffer.toOwnedSlice();
+    }
+
+    pub fn deinit(self: *const BasicProperties, allocator: std.mem.Allocator) void {
+        if (self.content_type) |ct| allocator.free(ct);
+        if (self.content_encoding) |ce| allocator.free(ce);
+        if (self.headers) |h| allocator.free(h);
+        if (self.correlation_id) |ci| allocator.free(ci);
+        if (self.reply_to) |rt| allocator.free(rt);
+        if (self.expiration) |e| allocator.free(e);
+        if (self.message_id) |mi| allocator.free(mi);
+        if (self.type) |t| allocator.free(t);
+        if (self.user_id) |ui| allocator.free(ui);
+        if (self.app_id) |ai| allocator.free(ai);
+        if (self.cluster_id) |ci| allocator.free(ci);
+    }
+};
+
+// Content Header Frame Structure
+pub const ContentHeader = struct {
+    class_id: u16,
+    weight: u16,
+    body_size: u64,
+    properties: BasicProperties,
+
+    pub fn decode(data: []const u8, allocator: std.mem.Allocator) !ContentHeader {
+        if (data.len < 12) return error.InvalidContentHeader;
+
+        var stream = std.io.fixedBufferStream(data);
+        const reader = stream.reader();
+
+        const class_id = try reader.readInt(u16, .big);
+        const weight = try reader.readInt(u16, .big);
+        const body_size = try reader.readInt(u64, .big);
+
+        // Remaining data is properties
+        const properties_data = data[12..];
+        const properties = try BasicProperties.decode(properties_data, allocator);
+
+        return ContentHeader{
+            .class_id = class_id,
+            .weight = weight,
+            .body_size = body_size,
+            .properties = properties,
+        };
+    }
+
+    pub fn encode(self: *const ContentHeader, allocator: std.mem.Allocator) ![]u8 {
+        var buffer = std.ArrayList(u8).init(allocator);
+        defer buffer.deinit();
+
+        try buffer.writer().writeInt(u16, self.class_id, .big);
+        try buffer.writer().writeInt(u16, self.weight, .big);
+        try buffer.writer().writeInt(u64, self.body_size, .big);
+
+        const properties_data = try self.properties.encode(allocator);
+        defer allocator.free(properties_data);
+        try buffer.appendSlice(properties_data);
+
+        return buffer.toOwnedSlice();
+    }
+
+    pub fn deinit(self: *const ContentHeader, allocator: std.mem.Allocator) void {
+        self.properties.deinit(allocator);
+    }
+};
+
 // Helper functions for AMQP encoding/decoding
 fn writeShortString(writer: anytype, str: []const u8) !void {
     try writer.writeInt(u8, @intCast(str.len), .big);
