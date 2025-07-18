@@ -10,6 +10,9 @@ const RecoveryAction = @import("../error/error_handler.zig").RecoveryAction;
 
 const ConnectionHandler = @import("connection_handler.zig").ConnectionHandler;
 const ChannelHandler = @import("channel_handler.zig").ChannelHandler;
+const ExchangeHandler = @import("exchange_handler.zig").ExchangeHandler;
+const QueueHandler = @import("queue_handler.zig").QueueHandler;
+const BasicHandler = @import("basic_handler.zig").BasicHandler;
 
 const PendingMessage = struct {
     exchange_name: []const u8,
@@ -29,6 +32,9 @@ pub const ProtocolHandler = struct {
     allocator: std.mem.Allocator,
     connection_handler: ConnectionHandler,
     channel_handler: ChannelHandler,
+    exchange_handler: ExchangeHandler,
+    queue_handler: QueueHandler,
+    basic_handler: BasicHandler,
     get_vhost_fn: ?*const fn (vhost_name: []const u8) ?*VirtualHost,
     persist_message_fn: ?*const fn (vhost_name: []const u8, queue_name: []const u8, message: *const Message) anyerror!void,
     error_handler_fn: ?*const fn (error_info: @import("../error/error_handler.zig").ErrorInfo) RecoveryAction,
@@ -41,6 +47,9 @@ pub const ProtocolHandler = struct {
             .allocator = allocator,
             .connection_handler = ConnectionHandler.init(allocator) catch unreachable,
             .channel_handler = ChannelHandler.init(allocator),
+            .exchange_handler = ExchangeHandler.init(allocator),
+            .queue_handler = QueueHandler.init(allocator),
+            .basic_handler = BasicHandler.init(allocator),
             .get_vhost_fn = null,
             .persist_message_fn = null,
             .error_handler_fn = null,
@@ -69,6 +78,9 @@ pub const ProtocolHandler = struct {
 
     pub fn setGetVirtualHostFunction(self: *ProtocolHandler, get_vhost_fn: *const fn (vhost_name: []const u8) ?*VirtualHost) void {
         self.get_vhost_fn = get_vhost_fn;
+        self.exchange_handler.setGetVirtualHostFunction(get_vhost_fn);
+        self.queue_handler.setGetVirtualHostFunction(get_vhost_fn);
+        self.basic_handler.setGetVirtualHostFunction(get_vhost_fn);
     }
 
     pub fn setPersistMessageFunction(self: *ProtocolHandler, persist_message_fn: *const fn (vhost_name: []const u8, queue_name: []const u8, message: *const Message) anyerror!void) void {
@@ -79,6 +91,9 @@ pub const ProtocolHandler = struct {
         self.error_handler_fn = error_handler_fn;
         self.connection_handler.setErrorHandler(error_handler_fn);
         self.channel_handler.setErrorHandler(error_handler_fn);
+        self.exchange_handler.setErrorHandler(error_handler_fn);
+        self.queue_handler.setErrorHandler(error_handler_fn);
+        self.basic_handler.setErrorHandler(error_handler_fn);
     }
 
     pub fn handleConnection(self: *ProtocolHandler, connection: *Connection) !void {
@@ -145,6 +160,9 @@ pub const ProtocolHandler = struct {
         switch (class_id) {
             10 => try self.handleConnectionMethod(connection, method_id, frame.payload[4..]),
             20 => try self.handleChannelMethod(connection, frame.channel_id, method_id, frame.payload[4..]),
+            40 => try self.handleExchangeMethod(connection, frame.channel_id, method_id, frame.payload[4..]),
+            50 => try self.handleQueueMethod(connection, frame.channel_id, method_id, frame.payload[4..]),
+            60 => try self.handleBasicMethod(connection, frame.channel_id, method_id, frame.payload[4..]),
             else => {
                 std.log.warn("Unknown method class {} on connection {}", .{ class_id, connection.id });
                 return error.UnknownMethodClass;
@@ -173,6 +191,50 @@ pub const ProtocolHandler = struct {
             else => {
                 std.log.warn("Unknown channel method {} on channel {} connection {}", .{ method_id, channel_id, connection.id });
                 return error.UnknownChannelMethod;
+            },
+        }
+    }
+
+    fn handleExchangeMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
+        switch (method_id) {
+            10 => try self.exchange_handler.handleExchangeDeclare(connection, channel_id, payload), // Declare
+            20 => try self.exchange_handler.handleExchangeDelete(connection, channel_id, payload), // Delete
+            30 => try self.exchange_handler.handleExchangeBind(connection, channel_id, payload), // Bind
+            40 => try self.exchange_handler.handleExchangeUnbind(connection, channel_id, payload), // Unbind
+            else => {
+                std.log.warn("Unknown exchange method {} on channel {} connection {}", .{ method_id, channel_id, connection.id });
+                return error.UnknownExchangeMethod;
+            },
+        }
+    }
+
+    fn handleQueueMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
+        switch (method_id) {
+            10 => try self.queue_handler.handleQueueDeclare(connection, channel_id, payload), // Declare
+            20 => try self.queue_handler.handleQueueBind(connection, channel_id, payload), // Bind
+            21 => try self.queue_handler.handleQueuePurge(connection, channel_id, payload), // Purge
+            40 => try self.queue_handler.handleQueueDelete(connection, channel_id, payload), // Delete
+            50 => try self.queue_handler.handleQueueUnbind(connection, channel_id, payload), // Unbind
+            else => {
+                std.log.warn("Unknown queue method {} on channel {} connection {}", .{ method_id, channel_id, connection.id });
+                return error.UnknownQueueMethod;
+            },
+        }
+    }
+
+    fn handleBasicMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
+        switch (method_id) {
+            20 => try self.basic_handler.handleBasicConsume(connection, channel_id, payload), // Consume
+            30 => try self.basic_handler.handleBasicCancel(connection, channel_id, payload), // Cancel
+            40 => try self.basic_handler.handleBasicPublish(connection, channel_id, payload), // Publish
+            70 => try self.basic_handler.handleBasicGet(connection, channel_id, payload), // Get
+            80 => try self.basic_handler.handleBasicAck(connection, channel_id, payload), // Ack
+            90 => try self.basic_handler.handleBasicReject(connection, channel_id, payload), // Reject
+            100 => try self.basic_handler.handleBasicRecover(connection, channel_id, payload), // Recover
+            120 => try self.basic_handler.handleBasicNack(connection, channel_id, payload), // Nack
+            else => {
+                std.log.warn("Unknown basic method {} on channel {} connection {}", .{ method_id, channel_id, connection.id });
+                return error.UnknownBasicMethod;
             },
         }
     }
