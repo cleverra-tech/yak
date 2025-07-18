@@ -43,10 +43,19 @@ pub const User = struct {
     }
 
     pub fn verifyPassword(self: *const User, password: []const u8) !bool {
-        const computed_hash = try hashPassword(self.allocator, password, self.algorithm);
-        defer self.allocator.free(computed_hash);
-
-        return std.mem.eql(u8, self.password_hash, computed_hash);
+        switch (self.algorithm) {
+            .plain => {
+                return std.mem.eql(u8, self.password_hash, password);
+            },
+            .sha256 => {
+                const computed_hash = try hashPassword(self.allocator, password, self.algorithm);
+                defer self.allocator.free(computed_hash);
+                return std.mem.eql(u8, self.password_hash, computed_hash);
+            },
+            .argon2 => {
+                return verifyArgon2Password(self.allocator, password, self.password_hash);
+            },
+        }
     }
 
     pub fn updatePassword(self: *User, new_password: []const u8) !void {
@@ -380,17 +389,72 @@ fn hashPassword(allocator: std.mem.Allocator, password: []const u8, algorithm: P
             return try std.fmt.allocPrint(allocator, "{x}", .{std.fmt.fmtSliceHexLower(&hash)});
         },
         .argon2 => {
-            // For production, use proper Argon2 implementation
-            // This is a simplified version for demonstration
-            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-            hasher.update("argon2_salt_");
-            hasher.update(password);
-            var hash: [32]u8 = undefined;
-            hasher.final(&hash);
+            // Use proper Argon2 implementation from std.crypto
+            var salt: [16]u8 = undefined;
+            std.crypto.random.bytes(&salt);
 
-            return try std.fmt.allocPrint(allocator, "argon2:{x}", .{std.fmt.fmtSliceHexLower(&hash)});
+            var hash: [32]u8 = undefined;
+            try std.crypto.pwhash.argon2.kdf(
+                &hash,
+                password,
+                &salt,
+                .{
+                    .t = 3, // time cost (iterations)
+                    .m = 65536, // memory cost in KB (64MB)
+                    .p = 1, // parallelism
+                },
+                .argon2id,
+            );
+
+            // Format as: argon2id$salt$hash (both base64 encoded)
+            const salt_b64 = std.base64.standard.Encoder.encode(allocator, &salt) catch return error.OutOfMemory;
+            defer allocator.free(salt_b64);
+
+            const hash_b64 = std.base64.standard.Encoder.encode(allocator, &hash) catch return error.OutOfMemory;
+            defer allocator.free(hash_b64);
+
+            return try std.fmt.allocPrint(allocator, "argon2id${s}${s}", .{ salt_b64, hash_b64 });
         },
     }
+}
+
+fn verifyArgon2Password(allocator: std.mem.Allocator, password: []const u8, stored_hash: []const u8) !bool {
+    // Parse the stored hash format: argon2id$salt_b64$hash_b64
+    if (!std.mem.startsWith(u8, stored_hash, "argon2id$")) {
+        return false;
+    }
+
+    const hash_parts = stored_hash[9..]; // Skip "argon2id$"
+    var parts_iter = std.mem.split(u8, hash_parts, "$");
+
+    const salt_b64 = parts_iter.next() orelse return false;
+    const expected_hash_b64 = parts_iter.next() orelse return false;
+
+    // Decode salt and expected hash from base64
+    var salt: [16]u8 = undefined;
+    const salt_decoded = std.base64.standard.Decoder.decode(&salt, salt_b64) catch return false;
+    if (salt_decoded.len != 16) return false;
+
+    var expected_hash: [32]u8 = undefined;
+    const hash_decoded = std.base64.standard.Decoder.decode(&expected_hash, expected_hash_b64) catch return false;
+    if (hash_decoded.len != 32) return false;
+
+    // Compute hash with the stored salt
+    var computed_hash: [32]u8 = undefined;
+    try std.crypto.pwhash.argon2.kdf(
+        &computed_hash,
+        password,
+        &salt,
+        .{
+            .t = 3, // time cost (iterations)
+            .m = 65536, // memory cost in KB (64MB)
+            .p = 1, // parallelism
+        },
+        .argon2id,
+    );
+
+    // Use constant-time comparison for security
+    return std.crypto.utils.timingSafeEql([32]u8, expected_hash, computed_hash);
 }
 
 test "user creation and authentication" {
@@ -409,6 +473,32 @@ test "user creation and authentication" {
 
     const invalid = try user.verifyPassword("wrongpass");
     try std.testing.expectEqual(false, invalid);
+}
+
+test "argon2 password hashing and verification" {
+    const allocator = std.testing.allocator;
+
+    var user = try User.init(allocator, "testuser", "testpass", .argon2);
+    defer user.deinit();
+
+    try std.testing.expectEqualStrings("testuser", user.username);
+    try std.testing.expectEqual(PasswordHashAlgorithm.argon2, user.algorithm);
+    try std.testing.expect(std.mem.startsWith(u8, user.password_hash, "argon2id$"));
+
+    // Test password verification
+    const valid = try user.verifyPassword("testpass");
+    try std.testing.expectEqual(true, valid);
+
+    const invalid = try user.verifyPassword("wrongpass");
+    try std.testing.expectEqual(false, invalid);
+
+    // Test password update
+    try user.updatePassword("newpass");
+    const new_valid = try user.verifyPassword("newpass");
+    try std.testing.expectEqual(true, new_valid);
+
+    const old_invalid = try user.verifyPassword("testpass");
+    try std.testing.expectEqual(false, old_invalid);
 }
 
 test "auth manager operations" {
@@ -441,4 +531,23 @@ test "auth manager operations" {
     // Test user creation
     try auth_manager.createUser("newuser", "newpass");
     try std.testing.expectEqual(@as(u32, 2), auth_manager.getUserCount());
+
+    // Test Argon2 authentication
+    const argon2_config = Config{
+        .tcp = undefined,
+        .storage = undefined,
+        .limits = undefined,
+        .auth = .{
+            .default_user = "admin",
+            .default_password = "admin123",
+            .password_hash_algorithm = .argon2,
+        },
+        .cli = undefined,
+    };
+
+    var argon2_auth = try AuthManager.init(allocator, &argon2_config);
+    defer argon2_auth.deinit();
+
+    const argon2_result = try argon2_auth.authenticate("admin", "admin123", null);
+    try std.testing.expectEqual(AuthResult.success, argon2_result);
 }
