@@ -48,7 +48,11 @@ pub const ProtocolHandler = struct {
     server_properties: std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     get_vhost_fn: ?*const fn (vhost_name: []const u8) ?*VirtualHost,
     pending_messages: std.HashMap(u64, PendingMessage, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage), // channel_id -> PendingMessage
-    next_message_id: u64,
+    next_message_id: std.atomic.Value(u64),
+    
+    // Thread safety mutexes
+    pending_messages_mutex: std.Thread.Mutex,
+    server_properties_mutex: std.Thread.RwLock,
 
     pub fn init(allocator: std.mem.Allocator) ProtocolHandler {
         var handler = ProtocolHandler{
@@ -56,7 +60,9 @@ pub const ProtocolHandler = struct {
             .server_properties = std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .get_vhost_fn = null,
             .pending_messages = std.HashMap(u64, PendingMessage, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage).init(allocator),
-            .next_message_id = 1,
+            .next_message_id = std.atomic.Value(u64).init(1),
+            .pending_messages_mutex = std.Thread.Mutex{},
+            .server_properties_mutex = std.Thread.RwLock{},
         };
 
         // Initialize server properties
@@ -68,6 +74,10 @@ pub const ProtocolHandler = struct {
     }
 
     pub fn deinit(self: *ProtocolHandler) void {
+        // Clean up server properties with write lock
+        self.server_properties_mutex.lock();
+        defer self.server_properties_mutex.unlock();
+        
         var iterator = self.server_properties.iterator();
         while (iterator.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -75,7 +85,10 @@ pub const ProtocolHandler = struct {
         }
         self.server_properties.deinit();
 
-        // Clean up pending messages
+        // Clean up pending messages with mutex
+        self.pending_messages_mutex.lock();
+        defer self.pending_messages_mutex.unlock();
+        
         var pending_iterator = self.pending_messages.iterator();
         while (pending_iterator.next()) |entry| {
             entry.value_ptr.*.deinit(self.allocator);
@@ -94,6 +107,9 @@ pub const ProtocolHandler = struct {
     }
 
     fn initServerProperties(self: *ProtocolHandler) !void {
+        self.server_properties_mutex.lock();
+        defer self.server_properties_mutex.unlock();
+        
         try self.server_properties.put(try self.allocator.dupe(u8, "product"), try self.allocator.dupe(u8, "Yak AMQP Message Broker"));
         try self.server_properties.put(try self.allocator.dupe(u8, "version"), try self.allocator.dupe(u8, "0.1.0"));
         try self.server_properties.put(try self.allocator.dupe(u8, "platform"), try self.allocator.dupe(u8, "Zig"));
@@ -166,7 +182,9 @@ pub const ProtocolHandler = struct {
         try payload.append(9);
 
         // Server properties (AMQP field table)
+        self.server_properties_mutex.lockShared();
         const properties_data = try self.encodeFieldTable(self.server_properties);
+        self.server_properties_mutex.unlockShared();
         defer self.allocator.free(properties_data);
         try payload.appendSlice(&std.mem.toBytes(@as(u32, @intCast(properties_data.len))));
         try payload.appendSlice(properties_data);
@@ -1332,6 +1350,9 @@ pub const ProtocolHandler = struct {
         const channel_key = (@as(u64, connection.id) << 16) | channel_id;
 
         // Remove any existing pending message for this channel
+        self.pending_messages_mutex.lock();
+        defer self.pending_messages_mutex.unlock();
+        
         if (self.pending_messages.fetchRemove(channel_key)) |existing| {
             var existing_msg = existing.value;
             existing_msg.deinit(self.allocator);
@@ -1561,6 +1582,10 @@ pub const ProtocolHandler = struct {
 
         // Get pending message for this channel
         const channel_key = (@as(u64, connection.id) << 16) | frame.channel_id;
+        
+        self.pending_messages_mutex.lock();
+        defer self.pending_messages_mutex.unlock();
+        
         var pending_message = self.pending_messages.getPtr(channel_key) orelse {
             std.log.warn("Content header frame without preceding Basic.Publish on channel {} connection {}", .{ frame.channel_id, connection.id });
             return error.UnexpectedContentHeader;
@@ -1601,6 +1626,10 @@ pub const ProtocolHandler = struct {
 
         // Get pending message for this channel
         const channel_key = (@as(u64, connection.id) << 16) | frame.channel_id;
+        
+        self.pending_messages_mutex.lock();
+        defer self.pending_messages_mutex.unlock();
+        
         var pending_message = self.pending_messages.getPtr(channel_key) orelse {
             std.log.warn("Content body frame without preceding Basic.Publish/Header on channel {} connection {}", .{ frame.channel_id, connection.id });
             return error.UnexpectedContentBody;
@@ -1645,10 +1674,14 @@ pub const ProtocolHandler = struct {
     fn completeMessage(self: *ProtocolHandler, connection: *Connection, channel_id: u16) !void {
         const channel_key = (@as(u64, connection.id) << 16) | channel_id;
 
+        self.pending_messages_mutex.lock();
         const pending_entry = self.pending_messages.fetchRemove(channel_key) orelse {
+            self.pending_messages_mutex.unlock();
             std.log.warn("Attempted to complete non-existent pending message on channel {} connection {}", .{ channel_id, connection.id });
             return error.NoPendingMessage;
         };
+        self.pending_messages_mutex.unlock();
+        
         var pending_message = pending_entry.value;
         defer pending_message.deinit(self.allocator);
 
@@ -1669,8 +1702,7 @@ pub const ProtocolHandler = struct {
         };
 
         // Create complete message object
-        const message_id = self.next_message_id;
-        self.next_message_id += 1;
+        const message_id = self.next_message_id.fetchAdd(1, .monotonic);
 
         var message = try Message.init(self.allocator, message_id, pending_message.exchange_name, pending_message.routing_key, pending_message.body_data.items);
         defer message.deinit();
@@ -1680,37 +1712,37 @@ pub const ProtocolHandler = struct {
             if (header.properties.delivery_mode) |dm| {
                 if (dm == 2) message.markPersistent();
             }
-            
+
             // Set content-type header if present
             if (header.properties.content_type) |ct| {
                 try message.setHeader("content-type", ct);
             }
-            
+
             // Set content-encoding header if present
             if (header.properties.content_encoding) |ce| {
                 try message.setHeader("content-encoding", ce);
             }
-            
+
             // Set correlation-id header if present
             if (header.properties.correlation_id) |ci| {
                 try message.setHeader("correlation-id", ci);
             }
-            
+
             // Set reply-to header if present
             if (header.properties.reply_to) |rt| {
                 try message.setHeader("reply-to", rt);
             }
-            
+
             // Set message-id header if present
             if (header.properties.message_id) |mi| {
                 try message.setHeader("message-id", mi);
             }
-            
+
             // Set user-id header if present
             if (header.properties.user_id) |ui| {
                 try message.setHeader("user-id", ui);
             }
-            
+
             // Set app-id header if present
             if (header.properties.app_id) |ai| {
                 try message.setHeader("app-id", ai);
