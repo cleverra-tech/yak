@@ -344,13 +344,13 @@ test "vhost queue listing" {
     var found_queue1 = false;
     var found_queue2 = false;
     var found_queue3 = false;
-    
+
     for (queue_list) |name| {
         if (std.mem.eql(u8, name, "queue1")) found_queue1 = true;
         if (std.mem.eql(u8, name, "queue2")) found_queue2 = true;
         if (std.mem.eql(u8, name, "queue3")) found_queue3 = true;
     }
-    
+
     try std.testing.expect(found_queue1);
     try std.testing.expect(found_queue2);
     try std.testing.expect(found_queue3);

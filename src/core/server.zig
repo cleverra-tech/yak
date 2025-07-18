@@ -368,10 +368,12 @@ pub const Server = struct {
 
             // Basic command handling
             if (std.mem.eql(u8, command, "help")) {
-                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  list queues [vhost] - List all queues in virtual host (default: /)\n  exit - Close connection\n";
+                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  list queues [vhost] - List all queues in virtual host (default: /)\n  queue info <name> [vhost] - Show detailed information about a queue\n  exit - Close connection\n";
                 try connection.stream.writeAll(help_msg);
             } else if (std.mem.startsWith(u8, command, "list queues")) {
                 try self.handleListQueuesCommand(connection, command);
+            } else if (std.mem.startsWith(u8, command, "queue info")) {
+                try self.handleQueueInfoCommand(connection, command);
             } else if (std.mem.eql(u8, command, "status")) {
                 const status_msg = try std.fmt.allocPrint(self.allocator, "Server Status:\n  Running: {}\n  Connections: {}\n  Virtual Hosts: {}\n  Shutdown Requested: {}\n", .{
                     self.running,
@@ -408,16 +410,16 @@ pub const Server = struct {
     fn handleListQueuesCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
         // Parse command to extract virtual host name
         var vhost_name: []const u8 = "/"; // Default virtual host
-        
+
         // Split command by spaces to check for vhost parameter
         var parts = std.mem.splitSequence(u8, command, " ");
         _ = parts.next(); // "list"
         _ = parts.next(); // "queues"
-        
+
         if (parts.next()) |vhost_arg| {
             vhost_name = std.mem.trim(u8, vhost_arg, " \t\n\r");
         }
-        
+
         // Get the virtual host
         const vhost = self.getVirtualHost(vhost_name);
         if (vhost == null) {
@@ -426,7 +428,7 @@ pub const Server = struct {
             try connection.stream.writeAll(error_msg);
             return;
         }
-        
+
         // Get list of queues
         const queue_names = vhost.?.listQueues(self.allocator) catch |err| {
             const error_msg = try std.fmt.allocPrint(self.allocator, "Error listing queues: {}\n", .{err});
@@ -440,7 +442,7 @@ pub const Server = struct {
             }
             self.allocator.free(queue_names);
         }
-        
+
         // Format and send response
         if (queue_names.len == 0) {
             const no_queues_msg = try std.fmt.allocPrint(self.allocator, "No queues found in virtual host '{s}'\n", .{vhost_name});
@@ -450,7 +452,7 @@ pub const Server = struct {
             const header_msg = try std.fmt.allocPrint(self.allocator, "Queues in virtual host '{s}':\n", .{vhost_name});
             defer self.allocator.free(header_msg);
             try connection.stream.writeAll(header_msg);
-            
+
             for (queue_names) |queue_name| {
                 // Get queue details for additional info
                 const queue = vhost.?.getQueue(queue_name).?;
@@ -463,6 +465,83 @@ pub const Server = struct {
                 defer self.allocator.free(queue_info);
                 try connection.stream.writeAll(queue_info);
             }
+        }
+    }
+
+    fn handleQueueInfoCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        // Parse command to extract queue name and optional virtual host name
+        var parts = std.mem.splitSequence(u8, command, " ");
+        _ = parts.next(); // "queue"
+        _ = parts.next(); // "info"
+
+        const queue_name = parts.next() orelse {
+            const error_msg = "Error: Queue name is required. Usage: queue info <name> [vhost]\n";
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        var vhost_name: []const u8 = "/"; // Default virtual host
+        if (parts.next()) |vhost_arg| {
+            vhost_name = std.mem.trim(u8, vhost_arg, " \t\n\r");
+        }
+
+        // Get the virtual host
+        const vhost = self.getVirtualHost(vhost_name);
+        if (vhost == null) {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error: Virtual host '{s}' not found\n", .{vhost_name});
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        }
+
+        // Get the queue
+        const queue = vhost.?.getQueue(queue_name);
+        if (queue == null) {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error: Queue '{s}' not found in virtual host '{s}'\n", .{ queue_name, vhost_name });
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        }
+
+        // Format and send detailed queue information
+        const queue_info = try std.fmt.allocPrint(self.allocator,
+            \\Queue Information: {s}
+            \\  Virtual Host: {s}
+            \\  Durable: {}
+            \\  Exclusive: {}
+            \\  Auto Delete: {}
+            \\  Messages: {}
+            \\  Consumers: {}
+            \\  Bindings: {}
+            \\  Memory Usage: {} bytes (estimated)
+            \\
+        , .{
+            queue_name,
+            vhost_name,
+            queue.?.durable,
+            queue.?.exclusive,
+            queue.?.auto_delete,
+            queue.?.getMessageCount(),
+            queue.?.getConsumerCount(),
+            queue.?.bindings.items.len,
+            queue.?.memory_usage,
+        });
+        defer self.allocator.free(queue_info);
+        try connection.stream.writeAll(queue_info);
+
+        // Show queue bindings if any exist
+        if (queue.?.bindings.items.len > 0) {
+            const bindings_header = "  Bindings:\n";
+            try connection.stream.writeAll(bindings_header);
+
+            for (queue.?.bindings.items) |binding| {
+                const binding_info = try std.fmt.allocPrint(self.allocator, "    Exchange: {s}, Routing Key: {s}\n", .{ binding.exchange_name, binding.routing_key });
+                defer self.allocator.free(binding_info);
+                try connection.stream.writeAll(binding_info);
+            }
+        } else {
+            const no_bindings = "  No bindings configured\n";
+            try connection.stream.writeAll(no_bindings);
         }
     }
 
@@ -831,4 +910,26 @@ test "server creation and basic operations" {
 
     const vhost = server.getVirtualHost("/");
     try std.testing.expect(vhost != null);
+}
+
+test "server queue info command handling" {
+    const allocator = std.testing.allocator;
+
+    var config = try Config.default(allocator);
+    defer config.deinit(allocator);
+
+    var server = try Server.init(allocator, config);
+    defer server.deinit();
+
+    // Create a test queue in the default virtual host
+    const vhost = server.getVirtualHost("/").?;
+    const queue_name = try vhost.declareQueue("test-info-queue", true, false, false, null);
+    try std.testing.expectEqualStrings("test-info-queue", queue_name);
+
+    // Verify queue was created
+    const queue = vhost.getQueue("test-info-queue");
+    try std.testing.expect(queue != null);
+    try std.testing.expectEqual(true, queue.?.durable);
+    try std.testing.expectEqual(false, queue.?.exclusive);
+    try std.testing.expectEqual(false, queue.?.auto_delete);
 }
