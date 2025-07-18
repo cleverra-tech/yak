@@ -2,6 +2,26 @@ const std = @import("std");
 
 pub const HeaderTable = std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage);
 
+pub const CompressionType = enum {
+    none,
+    gzip,
+    zlib,
+    
+    pub fn fromString(str: []const u8) CompressionType {
+        if (std.mem.eql(u8, str, "gzip")) return .gzip;
+        if (std.mem.eql(u8, str, "zlib")) return .zlib;
+        return .none;
+    }
+    
+    pub fn toString(self: CompressionType) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .gzip => "gzip",
+            .zlib => "zlib",
+        };
+    }
+};
+
 pub const DeathReason = enum {
     rejected,
     expired,
@@ -38,6 +58,11 @@ pub const Message = struct {
     delivery_count: u32,
     timestamp: i64,
 
+    // Compression support
+    compression_type: CompressionType,
+    original_size: ?usize, // Size before compression
+    is_compressed: bool,
+
     // Dead letter queue support
     deaths: std.ArrayList(DeathEvent),
     first_death_queue: ?[]const u8,
@@ -63,6 +88,9 @@ pub const Message = struct {
             .persistent = false,
             .delivery_count = 0,
             .timestamp = timestamp,
+            .compression_type = .none,
+            .original_size = null,
+            .is_compressed = false,
             .deaths = std.ArrayList(DeathEvent).init(allocator),
             .first_death_queue = null,
             .first_death_reason = null,
@@ -134,6 +162,16 @@ pub const Message = struct {
         try buffer.writer().writeInt(u32, self.delivery_count, .little);
         try buffer.writer().writeInt(u8, if (self.persistent) 1 else 0, .little);
 
+        // Write compression fields
+        try buffer.writer().writeInt(u8, @intFromEnum(self.compression_type), .little);
+        try buffer.writer().writeInt(u8, if (self.is_compressed) 1 else 0, .little);
+        if (self.original_size) |size| {
+            try buffer.writer().writeInt(u8, 1, .little); // has_original_size flag
+            try buffer.writer().writeInt(u64, size, .little);
+        } else {
+            try buffer.writer().writeInt(u8, 0, .little); // no original_size
+        }
+
         // Write variable-length fields
         try writeString(buffer.writer(), self.exchange);
         try writeString(buffer.writer(), self.routing_key);
@@ -159,6 +197,12 @@ pub const Message = struct {
         const delivery_count = try reader.readInt(u32, .little);
         const persistent = (try reader.readInt(u8, .little)) != 0;
 
+        // Read compression fields
+        const compression_type = @as(CompressionType, @enumFromInt(try reader.readInt(u8, .little)));
+        const is_compressed = (try reader.readInt(u8, .little)) != 0;
+        const has_original_size = (try reader.readInt(u8, .little)) != 0;
+        const original_size = if (has_original_size) try reader.readInt(u64, .little) else null;
+
         const exchange = try readString(reader, allocator);
         const routing_key = try readString(reader, allocator);
         const body = try readString(reader, allocator);
@@ -176,6 +220,9 @@ pub const Message = struct {
             .persistent = persistent,
             .delivery_count = delivery_count,
             .timestamp = @intCast(timestamp),
+            .compression_type = compression_type,
+            .original_size = original_size,
+            .is_compressed = is_compressed,
             .deaths = std.ArrayList(DeathEvent).init(allocator),
             .first_death_queue = null,
             .first_death_reason = null,
@@ -200,6 +247,9 @@ pub const Message = struct {
         cloned.persistent = self.persistent;
         cloned.delivery_count = self.delivery_count;
         cloned.timestamp = self.timestamp;
+        cloned.compression_type = self.compression_type;
+        cloned.original_size = self.original_size;
+        cloned.is_compressed = self.is_compressed;
 
         if (self.headers) |headers| {
             cloned.headers = HeaderTable.init(allocator);
@@ -330,7 +380,141 @@ pub const Message = struct {
             try self.setHeader("x-first-death-reason", reason_str);
         }
     }
+
+    // Compression configuration
+    pub const DEFAULT_COMPRESSION_THRESHOLD: usize = 1024; // 1KB
+
+    /// Compresses the message body if it exceeds the threshold
+    pub fn compressIfNeeded(self: *Message, compression_type: CompressionType, threshold: usize) !void {
+        if (self.is_compressed or self.body.len < threshold or compression_type == .none) {
+            return;
+        }
+
+        const compressed_body = try compressData(self.allocator, self.body, compression_type);
+        errdefer self.allocator.free(compressed_body);
+
+        // Only compress if we actually save space (add some overhead tolerance)
+        if (compressed_body.len < self.body.len - 32) {
+            self.allocator.free(self.body);
+            self.original_size = self.body.len;
+            self.body = compressed_body;
+            self.compression_type = compression_type;
+            self.is_compressed = true;
+            
+            // Set compression headers
+            try self.setHeader("content-encoding", compression_type.toString());
+            const original_size_str = try std.fmt.allocPrint(self.allocator, "{}", .{self.original_size.?});
+            try self.setHeader("x-original-size", original_size_str);
+        } else {
+            // Compression didn't save enough space, keep original
+            self.allocator.free(compressed_body);
+        }
+    }
+
+    /// Decompresses the message body if it's compressed
+    pub fn decompress(self: *Message) !void {
+        if (!self.is_compressed) {
+            return;
+        }
+
+        const decompressed_body = try decompressData(self.allocator, self.body, self.compression_type);
+        errdefer self.allocator.free(decompressed_body);
+
+        self.allocator.free(self.body);
+        self.body = decompressed_body;
+        self.is_compressed = false;
+        self.compression_type = .none;
+        self.original_size = null;
+
+        // Remove compression headers
+        _ = self.removeHeader("content-encoding");
+        _ = self.removeHeader("x-original-size");
+    }
+
+    /// Gets the effective body size (uncompressed size if compressed)
+    pub fn getEffectiveSize(self: *const Message) usize {
+        if (self.is_compressed and self.original_size != null) {
+            return self.original_size.?;
+        }
+        return self.body.len;
+    }
+
+    /// Gets compression ratio as a percentage (0-100)
+    pub fn getCompressionRatio(self: *const Message) ?f32 {
+        if (!self.is_compressed or self.original_size == null) {
+            return null;
+        }
+        const ratio = @as(f32, @floatFromInt(self.body.len)) / @as(f32, @floatFromInt(self.original_size.?));
+        return ratio * 100.0;
+    }
+
+    /// Removes a header and returns the old value if it existed
+    pub fn removeHeader(self: *Message, key: []const u8) ?[]const u8 {
+        if (self.headers == null) return null;
+        
+        var headers = &self.headers.?;
+        if (headers.fetchRemove(key)) |kv| {
+            self.allocator.free(kv.key);
+            const value = kv.value;
+            return value;
+        }
+        return null;
+    }
 };
+
+/// Compresses data using the specified compression type
+fn compressData(allocator: std.mem.Allocator, data: []const u8, compression_type: CompressionType) ![]u8 {
+    switch (compression_type) {
+        .none => return try allocator.dupe(u8, data),
+        .gzip => {
+            var compressed = std.ArrayList(u8).init(allocator);
+            errdefer compressed.deinit();
+            
+            var compressor = try std.compress.gzip.compressor(compressed.writer(), .{});
+            try compressor.writer().writeAll(data);
+            try compressor.finish();
+            
+            return try compressed.toOwnedSlice();
+        },
+        .zlib => {
+            var compressed = std.ArrayList(u8).init(allocator);
+            errdefer compressed.deinit();
+            
+            var compressor = try std.compress.zlib.compressor(compressed.writer(), .{});
+            try compressor.writer().writeAll(data);
+            try compressor.finish();
+            
+            return try compressed.toOwnedSlice();
+        },
+    }
+}
+
+/// Decompresses data using the specified compression type
+fn decompressData(allocator: std.mem.Allocator, compressed_data: []const u8, compression_type: CompressionType) ![]u8 {
+    switch (compression_type) {
+        .none => return try allocator.dupe(u8, compressed_data),
+        .gzip => {
+            var fbs = std.io.fixedBufferStream(compressed_data);
+            var decompressor = std.compress.gzip.decompressor(fbs.reader());
+            
+            var decompressed = std.ArrayList(u8).init(allocator);
+            errdefer decompressed.deinit();
+            
+            try decompressor.reader().readAllArrayList(&decompressed, std.math.maxInt(usize));
+            return try decompressed.toOwnedSlice();
+        },
+        .zlib => {
+            var fbs = std.io.fixedBufferStream(compressed_data);
+            var decompressor = std.compress.zlib.decompressor(fbs.reader());
+            
+            var decompressed = std.ArrayList(u8).init(allocator);
+            errdefer decompressed.deinit();
+            
+            try decompressor.reader().readAllArrayList(&decompressed, std.math.maxInt(usize));
+            return try decompressed.toOwnedSlice();
+        },
+    }
+}
 
 // Helper functions for serialization
 fn writeString(writer: anytype, str: []const u8) !void {
@@ -424,4 +608,68 @@ test "message serialization" {
     try std.testing.expectEqual(original.persistent, decoded.persistent);
     try std.testing.expectEqual(original.delivery_count, decoded.delivery_count);
     try std.testing.expectEqualStrings("application/json", decoded.getHeader("content-type").?);
+}
+
+test "message compression and decompression" {
+    const allocator = std.testing.allocator;
+
+    // Create a large message to test compression
+    const large_body = "This is a large message body that should be compressed when it exceeds the threshold. " ++
+                      "We repeat this text multiple times to ensure it's large enough for compression to be effective. " ++
+                      "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut " ++
+                      "labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco " ++
+                      "laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in " ++
+                      "voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat " ++
+                      "non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. " ++
+                      "This text is repeated to make the message large enough for compression to be worthwhile.";
+
+    var message = try Message.init(allocator, 1, "test.exchange", "test.key", large_body);
+    defer message.deinit();
+
+    const original_size = message.body.len;
+
+    // Test compression
+    try message.compressIfNeeded(.gzip, 100); // Low threshold to force compression
+    
+    try std.testing.expect(message.is_compressed);
+    try std.testing.expectEqual(CompressionType.gzip, message.compression_type);
+    try std.testing.expectEqual(original_size, message.original_size.?);
+    try std.testing.expect(message.body.len < original_size); // Compressed should be smaller
+
+    // Test compression headers
+    try std.testing.expectEqualStrings("gzip", message.getHeader("content-encoding").?);
+    
+    // Test getting effective size
+    try std.testing.expectEqual(original_size, message.getEffectiveSize());
+    
+    // Test compression ratio
+    const ratio = message.getCompressionRatio().?;
+    try std.testing.expect(ratio > 0.0 and ratio < 100.0);
+
+    // Test decompression
+    try message.decompress();
+    
+    try std.testing.expect(!message.is_compressed);
+    try std.testing.expectEqual(CompressionType.none, message.compression_type);
+    try std.testing.expectEqual(@as(?usize, null), message.original_size);
+    try std.testing.expectEqualStrings(large_body, message.body);
+    try std.testing.expectEqual(@as(?[]const u8, null), message.getHeader("content-encoding"));
+}
+
+test "message compression threshold" {
+    const allocator = std.testing.allocator;
+
+    // Small message - should not be compressed
+    var small_message = try Message.init(allocator, 1, "test.exchange", "test.key", "small");
+    defer small_message.deinit();
+
+    try small_message.compressIfNeeded(.gzip, 100);
+    try std.testing.expect(!small_message.is_compressed);
+
+    // Large message - should be compressed
+    var large_message = try Message.init(allocator, 2, "test.exchange", "test.key", "a" ** 200);
+    defer large_message.deinit();
+
+    try large_message.compressIfNeeded(.gzip, 100);
+    try std.testing.expect(large_message.is_compressed);
 }

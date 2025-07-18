@@ -251,6 +251,14 @@ pub const Queue = struct {
         var message = self.messages.orderedRemove(0);
         self.messages_ready = @max(1, self.messages_ready) - 1;
 
+        // Decompress message if it's compressed before delivery
+        if (message.is_compressed) {
+            message.decompress() catch |err| {
+                std.log.err("Failed to decompress message in queue {s}: {}", .{ self.name, err });
+                // Continue with compressed message if decompression fails
+            };
+        }
+
         if (!no_ack) {
             message.id = self.next_delivery_tag;
             self.next_delivery_tag += 1;

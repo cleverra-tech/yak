@@ -3,6 +3,7 @@ const Exchange = @import("../routing/exchange.zig").Exchange;
 const ExchangeType = @import("../routing/exchange.zig").ExchangeType;
 const Queue = @import("../routing/queue.zig").Queue;
 const Message = @import("../message.zig").Message;
+const CompressionType = @import("../message.zig").CompressionType;
 
 pub const VirtualHost = struct {
     name: []const u8,
@@ -271,6 +272,9 @@ pub const VirtualHost = struct {
         // Get the exchange
         const exchange = self.exchanges.get(exchange_name) orelse return error.ExchangeNotFound;
 
+        // Apply automatic compression if configured and message is large enough
+        try self.applyCompressionIfNeeded(message, exchange_name);
+
         // Route the message to get matching queues
         const matched_queues = try exchange.routeMessage(message, self.allocator);
         defer self.allocator.free(matched_queues);
@@ -365,6 +369,27 @@ pub const VirtualHost = struct {
         try stats.put("total_consumers", std.json.Value{ .integer = @intCast(total_consumers) });
 
         return std.json.Value{ .object = stats };
+    }
+
+    /// Apply compression to a message if it meets the criteria
+    fn applyCompressionIfNeeded(self: *VirtualHost, message: *Message, exchange_name: []const u8) !void {
+        _ = self;
+        
+        // For now, use simple built-in compression logic
+        // In a full implementation, this would read from the broker's compression configuration
+        const threshold = Message.DEFAULT_COMPRESSION_THRESHOLD;
+        const compression_type = CompressionType.gzip;
+        
+        // Simple policy: compress large messages on specific exchanges
+        const should_compress = message.body.len >= threshold and 
+            !message.is_compressed and 
+            (std.mem.startsWith(u8, exchange_name, "amq.") or 
+             std.mem.eql(u8, exchange_name, "logs") or
+             std.mem.eql(u8, exchange_name, "events"));
+        
+        if (should_compress) {
+            try message.compressIfNeeded(compression_type, threshold);
+        }
     }
 };
 

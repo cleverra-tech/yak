@@ -1,4 +1,6 @@
 const std = @import("std");
+const Message = @import("message.zig");
+const CompressionType = Message.CompressionType;
 
 pub const Config = struct {
     tcp: TcpConfig,
@@ -8,6 +10,7 @@ pub const Config = struct {
     auth: AuthConfig,
     cli: CliConfig,
     metrics: MetricsConfig,
+    compression: CompressionConfig,
 
     const TcpConfig = struct {
         host: []const u8,
@@ -132,6 +135,51 @@ pub const Config = struct {
         health_check_enabled: bool,
     };
 
+    const CompressionConfig = struct {
+        enabled: bool,
+        default_type: []const u8, // "gzip", "zlib", "none"
+        threshold_bytes: usize,
+        level: i32, // Compression level (1-9 for most algorithms)
+        auto_compress: bool, // Auto-compress messages over threshold
+        whitelist_exchanges: [][]const u8, // Only compress messages from these exchanges
+        blacklist_exchanges: [][]const u8, // Never compress messages from these exchanges
+        
+        pub fn getCompressionType(self: *const CompressionConfig) CompressionType {
+            if (!self.enabled) return .none;
+            
+            if (std.mem.eql(u8, self.default_type, "gzip")) return .gzip;
+            if (std.mem.eql(u8, self.default_type, "zlib")) return .zlib;
+            return .none;
+        }
+        
+        pub fn shouldCompress(self: *const CompressionConfig, exchange: []const u8, body_size: usize) bool {
+            if (!self.enabled or !self.auto_compress or body_size < self.threshold_bytes) {
+                return false;
+            }
+            
+            // Check blacklist first
+            for (self.blacklist_exchanges) |blacklisted| {
+                if (std.mem.eql(u8, exchange, blacklisted)) {
+                    return false;
+                }
+            }
+            
+            // If whitelist is empty, allow all (except blacklisted)
+            if (self.whitelist_exchanges.len == 0) {
+                return true;
+            }
+            
+            // Check whitelist
+            for (self.whitelist_exchanges) |whitelisted| {
+                if (std.mem.eql(u8, exchange, whitelisted)) {
+                    return true;
+                }
+            }
+            
+            return false;
+        }
+    };
+
     pub fn default(allocator: std.mem.Allocator) !Config {
         return Config{
             .tcp = TcpConfig{
@@ -201,6 +249,15 @@ pub const Config = struct {
                 .prometheus_enabled = true,
                 .json_enabled = true,
                 .health_check_enabled = true,
+            },
+            .compression = CompressionConfig{
+                .enabled = true,
+                .default_type = try allocator.dupe(u8, "gzip"),
+                .threshold_bytes = 1024, // 1KB
+                .level = 6, // Default compression level
+                .auto_compress = true,
+                .whitelist_exchanges = &[_][]const u8{}, // Empty means allow all
+                .blacklist_exchanges = &[_][]const u8{}, // Empty means block none
             },
         };
     }
@@ -314,6 +371,15 @@ pub const Config = struct {
                 .json_enabled = config.metrics.json_enabled,
                 .health_check_enabled = config.metrics.health_check_enabled,
             },
+            .compression = CompressionConfig{
+                .enabled = config.compression.enabled,
+                .default_type = try allocator.dupe(u8, config.compression.default_type),
+                .threshold_bytes = config.compression.threshold_bytes,
+                .level = config.compression.level,
+                .auto_compress = config.compression.auto_compress,
+                .whitelist_exchanges = try cloneStringArray(allocator, config.compression.whitelist_exchanges),
+                .blacklist_exchanges = try cloneStringArray(allocator, config.compression.blacklist_exchanges),
+            },
         };
     }
 
@@ -353,6 +419,14 @@ pub const Config = struct {
         }
 
         return result.toOwnedSlice();
+    }
+
+    fn cloneStringArray(allocator: std.mem.Allocator, strings: [][]const u8) ![][]const u8 {
+        var result = try allocator.alloc([]const u8, strings.len);
+        for (strings, 0..) |str, i| {
+            result[i] = try allocator.dupe(u8, str);
+        }
+        return result;
     }
 };
 
