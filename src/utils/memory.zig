@@ -265,7 +265,7 @@ pub const MemoryUtils = struct {
         const allocator = arena.allocator();
 
         const pid_filter = try std.fmt.allocPrint(allocator, "pid eq {}", .{std.process.getpid()});
-        
+
         const result = std.process.Child.run(.{
             .allocator = allocator,
             .argv = &[_][]const u8{ "tasklist", "/fi", pid_filter, "/fo", "csv" },
@@ -305,7 +305,7 @@ pub const MemoryUtils = struct {
         const allocator = arena.allocator();
 
         const pid_str = try std.fmt.allocPrint(allocator, "{}", .{std.process.getpid()});
-        
+
         const result = std.process.Child.run(.{
             .allocator = allocator,
             .argv = &[_][]const u8{ "ps", "-o", "rss=", "-p", pid_str },
@@ -313,7 +313,7 @@ pub const MemoryUtils = struct {
 
         const rss_str = std.mem.trim(u8, result.stdout, " \t\n\r");
         const rss_kb = std.fmt.parseInt(usize, rss_str, 10) catch return error.MemoryInfoNotFound;
-        
+
         return rss_kb * 1024; // Convert KB to bytes
     }
 
@@ -322,7 +322,7 @@ pub const MemoryUtils = struct {
         // This is not accurate but provides a basic indication
         const heap_stats = std.heap.page_allocator.vtable;
         _ = heap_stats; // Suppress unused variable warning
-        
+
         // Return a conservative estimate
         // In practice, this should be enhanced with more sophisticated tracking
         return 1024 * 1024; // 1MB base estimate

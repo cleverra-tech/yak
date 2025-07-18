@@ -317,22 +317,160 @@ pub const ProtocolHandler = struct {
         std.log.debug("Connection.CloseOk sent to connection {}", .{connection.id});
     }
 
-    fn handleChannelMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
-        _ = self;
-        _ = connection;
-        _ = channel_id;
-        _ = method_id;
-        _ = payload;
+    fn handleChannelOpen(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        _ = payload; // Channel.Open has no arguments in AMQP 0-9-1
 
-        // TODO: Implement channel methods (Open, Close, Flow, etc.)
-        std.log.debug("Channel method not yet implemented: channel={}, method={}", .{ channel_id, method_id });
+        // Validate channel ID (0 is reserved for connection-level operations)
+        if (channel_id == 0) {
+            std.log.warn("Invalid channel ID 0 for Channel.Open on connection {}", .{connection.id});
+            return error.InvalidChannelId;
+        }
+
+        // Check if connection is open
+        if (!connection.isOpen()) {
+            std.log.warn("Channel.Open on non-open connection {}", .{connection.id});
+            return error.ConnectionNotOpen;
+        }
+
+        // Create the channel
+        connection.addChannel(channel_id) catch |err| switch (err) {
+            error.ChannelAlreadyExists => {
+                std.log.warn("Channel {} already exists on connection {}", .{ channel_id, connection.id });
+                return error.ChannelAlreadyExists;
+            },
+            else => return err,
+        };
+
+        // Send Channel.OpenOk
+        try self.sendChannelOpenOk(connection, channel_id);
+
+        std.log.debug("Channel.Open handled for connection {}, channel {}", .{ connection.id, channel_id });
+    }
+
+    fn sendChannelOpenOk(self: *ProtocolHandler, connection: *Connection, channel_id: u16) !void {
+        var payload = std.ArrayList(u8).init(self.allocator);
+        defer payload.deinit();
+
+        // Class ID (Channel = 20)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 20)));
+        // Method ID (OpenOk = 11)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 11)));
+
+        // Reserved field (empty long string)
+        try payload.appendSlice(&std.mem.toBytes(@as(u32, 0)));
+
+        const frame = Frame{
+            .frame_type = .method,
+            .channel = channel_id,
+            .payload = try self.allocator.dupe(u8, payload.items),
+        };
+        defer self.allocator.free(frame.payload);
+
+        try connection.sendFrame(frame);
+        std.log.debug("Channel.OpenOk sent to connection {}, channel {}", .{ connection.id, channel_id });
+    }
+
+    fn handleChannelFlow(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        if (payload.len < 1) {
+            return error.InvalidChannelFlow;
+        }
+
+        const active = (payload[0] & 0x01) != 0;
+
+        // Get the channel
+        const channel = connection.getChannel(channel_id) orelse {
+            std.log.warn("Channel.Flow on non-existent channel {} on connection {}", .{ channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
+
+        // Update flow control state
+        channel.flow_active = active;
+
+        // Send Channel.FlowOk
+        try self.sendChannelFlowOk(connection, channel_id, active);
+
+        std.log.debug("Channel.Flow handled for connection {}, channel {}: active={}", .{ connection.id, channel_id, active });
+    }
+
+    fn sendChannelFlowOk(self: *ProtocolHandler, connection: *Connection, channel_id: u16, active: bool) !void {
+        var payload = std.ArrayList(u8).init(self.allocator);
+        defer payload.deinit();
+
+        // Class ID (Channel = 20)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 20)));
+        // Method ID (FlowOk = 21)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 21)));
+
+        // Active flag
+        try payload.append(if (active) 1 else 0);
+
+        const frame = Frame{
+            .frame_type = .method,
+            .channel = channel_id,
+            .payload = try self.allocator.dupe(u8, payload.items),
+        };
+        defer self.allocator.free(frame.payload);
+
+        try connection.sendFrame(frame);
+        std.log.debug("Channel.FlowOk sent to connection {}, channel {}: active={}", .{ connection.id, channel_id, active });
+    }
+
+    fn handleChannelClose(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        _ = payload; // TODO: Parse close reply code, reply text, class id, method id
+
+        // Get the channel to ensure it exists
+        const channel = connection.getChannel(channel_id) orelse {
+            std.log.warn("Channel.Close on non-existent channel {} on connection {}", .{ channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
+
+        // Mark channel as inactive
+        channel.active = false;
+
+        // Send Channel.CloseOk
+        try self.sendChannelCloseOk(connection, channel_id);
+
+        // Remove the channel
+        connection.removeChannel(channel_id);
+
+        std.log.debug("Channel.Close handled for connection {}, channel {}", .{ connection.id, channel_id });
+    }
+
+    fn sendChannelCloseOk(self: *ProtocolHandler, connection: *Connection, channel_id: u16) !void {
+        var payload = std.ArrayList(u8).init(self.allocator);
+        defer payload.deinit();
+
+        // Class ID (Channel = 20)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 20)));
+        // Method ID (CloseOk = 41)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 41)));
+
+        const frame = Frame{
+            .frame_type = .method,
+            .channel = channel_id,
+            .payload = try self.allocator.dupe(u8, payload.items),
+        };
+        defer self.allocator.free(frame.payload);
+
+        try connection.sendFrame(frame);
+        std.log.debug("Channel.CloseOk sent to connection {}, channel {}", .{ connection.id, channel_id });
+    }
+
+    fn handleChannelMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
+        switch (method_id) {
+            10 => try self.handleChannelOpen(connection, channel_id, payload), // Open
+            20 => try self.handleChannelFlow(connection, channel_id, payload), // Flow
+            40 => try self.handleChannelClose(connection, channel_id, payload), // Close
+            else => {
+                std.log.warn("Unknown channel method {} on connection {}, channel {}", .{ method_id, connection.id, channel_id });
+                return error.UnknownChannelMethod;
+            },
+        }
     }
 
     fn handleExchangeMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
         _ = self;
         _ = connection;
-        _ = channel_id;
-        _ = method_id;
         _ = payload;
 
         // TODO: Implement exchange methods (Declare, Delete, Bind, etc.)
@@ -342,8 +480,6 @@ pub const ProtocolHandler = struct {
     fn handleQueueMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
         _ = self;
         _ = connection;
-        _ = channel_id;
-        _ = method_id;
         _ = payload;
 
         // TODO: Implement queue methods (Declare, Delete, Bind, Purge, etc.)
@@ -353,8 +489,6 @@ pub const ProtocolHandler = struct {
     fn handleBasicMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
         _ = self;
         _ = connection;
-        _ = channel_id;
-        _ = method_id;
         _ = payload;
 
         // TODO: Implement basic methods (Publish, Consume, Ack, Nack, etc.)
@@ -363,8 +497,6 @@ pub const ProtocolHandler = struct {
 
     fn handleHeaderFrame(self: *ProtocolHandler, connection: *Connection, frame: Frame) !void {
         _ = self;
-        _ = connection;
-        _ = frame;
 
         // TODO: Implement content header handling
         std.log.debug("Header frame not yet implemented: connection={}, channel={}", .{ connection.id, frame.channel });
@@ -372,8 +504,6 @@ pub const ProtocolHandler = struct {
 
     fn handleBodyFrame(self: *ProtocolHandler, connection: *Connection, frame: Frame) !void {
         _ = self;
-        _ = connection;
-        _ = frame;
 
         // TODO: Implement content body handling
         std.log.debug("Body frame not yet implemented: connection={}, channel={}", .{ connection.id, frame.channel });
@@ -445,4 +575,80 @@ test "field table encoding" {
     // Should contain encoded key-value pairs
     // Format: key_len + key + 'S' + value_len(4 bytes) + value
     try std.testing.expect(encoded.len > 10); // At least one meaningful entry
+}
+
+test "channel method handling" {
+    const allocator = std.testing.allocator;
+
+    var handler = ProtocolHandler.init(allocator);
+    defer handler.deinit();
+
+    // Create a mock connection
+    const mock_socket = std.net.Stream{ .handle = 0 };
+    var connection = try Connection.init(allocator, 1, mock_socket);
+    defer connection.deinit();
+
+    // Set connection to open state for channel operations
+    connection.setState(.open);
+
+    // Test Channel.Open (method 10)
+    const channel_id: u16 = 1;
+    const empty_payload = [_]u8{};
+
+    // This should succeed and create the channel
+    try handler.handleChannelOpen(&connection, channel_id, &empty_payload);
+
+    // Verify channel was created
+    const channel = connection.getChannel(channel_id);
+    try std.testing.expect(channel != null);
+    try std.testing.expectEqual(@as(u16, 1), channel.?.id);
+    try std.testing.expectEqual(true, channel.?.active);
+    try std.testing.expectEqual(true, channel.?.flow_active);
+
+    // Test Channel.Flow (method 20)
+    const flow_payload = [_]u8{0}; // active = false
+    try handler.handleChannelFlow(&connection, channel_id, &flow_payload);
+
+    // Verify flow state was updated
+    try std.testing.expectEqual(false, channel.?.flow_active);
+
+    // Test Channel.Close (method 40)
+    try handler.handleChannelClose(&connection, channel_id, &empty_payload);
+
+    // Verify channel was removed
+    const removed_channel = connection.getChannel(channel_id);
+    try std.testing.expect(removed_channel == null);
+}
+
+test "channel method error handling" {
+    const allocator = std.testing.allocator;
+
+    var handler = ProtocolHandler.init(allocator);
+    defer handler.deinit();
+
+    const mock_socket = std.net.Stream{ .handle = 0 };
+    var connection = try Connection.init(allocator, 1, mock_socket);
+    defer connection.deinit();
+
+    connection.setState(.open);
+
+    const empty_payload = [_]u8{};
+
+    // Test Channel.Open with invalid channel ID (0)
+    const result_invalid_id = handler.handleChannelOpen(&connection, 0, &empty_payload);
+    try std.testing.expectError(error.InvalidChannelId, result_invalid_id);
+
+    // Test Channel.Flow on non-existent channel
+    const flow_payload = [_]u8{1};
+    const result_no_channel = handler.handleChannelFlow(&connection, 99, &flow_payload);
+    try std.testing.expectError(error.ChannelNotFound, result_no_channel);
+
+    // Test Channel.Close on non-existent channel
+    const result_close_no_channel = handler.handleChannelClose(&connection, 99, &empty_payload);
+    try std.testing.expectError(error.ChannelNotFound, result_close_no_channel);
+
+    // Test Channel.Open when connection is not open
+    connection.setState(.handshake);
+    const result_not_open = handler.handleChannelOpen(&connection, 1, &empty_payload);
+    try std.testing.expectError(error.ConnectionNotOpen, result_not_open);
 }
