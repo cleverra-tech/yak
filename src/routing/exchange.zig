@@ -100,11 +100,10 @@ pub const Exchange = struct {
         routing_key: []const u8,
         arguments: ?[]const u8,
     ) !void {
-        _ = arguments; // TODO: Use arguments for matching
-
         for (self.bindings.items, 0..) |binding, i| {
             if (std.mem.eql(u8, binding.queue_name, queue_name) and
-                std.mem.eql(u8, binding.routing_key, routing_key))
+                std.mem.eql(u8, binding.routing_key, routing_key) and
+                binding.argumentsMatch(arguments))
             {
                 var removed_binding = self.bindings.swapRemove(i);
                 removed_binding.deinit();
@@ -353,4 +352,35 @@ test "exchange routing" {
     defer allocator.free(fanout_matched);
 
     try std.testing.expectEqual(@as(usize, 2), fanout_matched.len);
+}
+
+test "exchange binding arguments matching" {
+    const allocator = std.testing.allocator;
+
+    var exchange = try Exchange.init(allocator, "test", .direct, true, false, false, null);
+    defer exchange.deinit();
+
+    // Add bindings with different arguments
+    try exchange.bindQueue("queue1", "key1", null);
+    try exchange.bindQueue("queue2", "key1", "args1");
+    try exchange.bindQueue("queue3", "key1", "args2");
+
+    try std.testing.expectEqual(@as(u32, 3), exchange.getBindingCount());
+
+    // Unbind with null arguments should only remove the null binding
+    try exchange.unbindQueue("queue1", "key1", null);
+    try std.testing.expectEqual(@as(u32, 2), exchange.getBindingCount());
+
+    // Unbind with specific arguments should only remove matching binding
+    try exchange.unbindQueue("queue2", "key1", "args1");
+    try std.testing.expectEqual(@as(u32, 1), exchange.getBindingCount());
+
+    // Trying to unbind with wrong arguments should fail
+    const result = exchange.unbindQueue("queue3", "key1", "wrong_args");
+    try std.testing.expectError(error.BindingNotFound, result);
+    try std.testing.expectEqual(@as(u32, 1), exchange.getBindingCount());
+
+    // Unbind with correct arguments should succeed
+    try exchange.unbindQueue("queue3", "key1", "args2");
+    try std.testing.expectEqual(@as(u32, 0), exchange.getBindingCount());
 }
