@@ -1168,12 +1168,332 @@ pub const ProtocolHandler = struct {
     }
 
     fn handleBasicMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
+        switch (method_id) {
+            10 => try self.handleBasicQos(connection, channel_id, payload), // QoS
+            20 => try self.handleBasicConsume(connection, channel_id, payload), // Consume
+            30 => try self.handleBasicCancel(connection, channel_id, payload), // Cancel
+            40 => try self.handleBasicPublish(connection, channel_id, payload), // Publish
+            50 => try self.handleBasicReturn(connection, channel_id, payload), // Return
+            60 => try self.handleBasicDeliver(connection, channel_id, payload), // Deliver
+            70 => try self.handleBasicGet(connection, channel_id, payload), // Get
+            80 => try self.handleBasicAck(connection, channel_id, payload), // Ack
+            90 => try self.handleBasicReject(connection, channel_id, payload), // Reject
+            100 => try self.handleBasicRecoverAsync(connection, channel_id, payload), // RecoverAsync
+            110 => try self.handleBasicRecover(connection, channel_id, payload), // Recover
+            120 => try self.handleBasicNack(connection, channel_id, payload), // Nack
+            else => {
+                std.log.warn("Unknown basic method {} on channel {} connection {}", .{ method_id, channel_id, connection.id });
+                return error.UnknownBasicMethod;
+            },
+        }
+    }
+
+    // Basic method implementations
+    fn handleBasicQos(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        _ = self;
+        
+        // Check if channel exists
+        const channel = connection.getChannel(channel_id) orelse {
+            std.log.warn("Basic.QoS on non-existent channel {} on connection {}", .{ channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
+
+        if (!channel.active) {
+            return error.ChannelNotActive;
+        }
+
+        if (payload.len < 5) return error.InvalidBasicQos;
+
+        var stream = std.io.fixedBufferStream(payload);
+        const reader = stream.reader();
+
+        const prefetch_size = try reader.readInt(u32, .big);
+        const prefetch_count = try reader.readInt(u16, .big);
+        const global = (try reader.readInt(u8, .big)) & 0x01 != 0;
+
+        // Update channel QoS settings
+        if (!global) {
+            channel.prefetch_size = prefetch_size;
+            channel.prefetch_count = prefetch_count;
+        }
+
+        // Send Basic.QosOk response
+        const response_frame = Frame{
+            .frame_type = .method,
+            .channel_id = channel_id,
+            .payload = &[_]u8{ 0x00, 0x3C, 0x00, 0x0B }, // class=60, method=11 (QosOk)
+        };
+
+        try connection.sendFrame(response_frame);
+        std.log.debug("Basic.QosOk sent to connection {}, channel {}", .{ connection.id, channel_id });
+    }
+
+    fn handleBasicPublish(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        // Check if channel exists
+        const channel = connection.getChannel(channel_id) orelse {
+            std.log.warn("Basic.Publish on non-existent channel {} on connection {}", .{ channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
+
+        if (!channel.active) {
+            return error.ChannelNotActive;
+        }
+
+        // Get virtual host
+        const vhost = self.getVirtualHost(connection) orelse {
+            std.log.warn("Basic.Publish on connection {} with no virtual host", .{connection.id});
+            return error.NoVirtualHost;
+        };
+
+        if (payload.len < 3) return error.InvalidBasicPublish;
+
+        var stream = std.io.fixedBufferStream(payload);
+        const reader = stream.reader();
+
+        // Parse Basic.Publish parameters
+        _ = try reader.readInt(u16, .big); // reserved
+
+        // Read exchange name
+        const exchange_len = try reader.readInt(u8, .big);
+        var exchange_buf: [256]u8 = undefined;
+        if (exchange_len > exchange_buf.len) return error.ExchangeNameTooLong;
+        try reader.readNoEof(exchange_buf[0..exchange_len]);
+        const exchange_name = if (exchange_len == 0) "" else exchange_buf[0..exchange_len];
+
+        // Read routing key
+        const routing_key_len = try reader.readInt(u8, .big);
+        var routing_key_buf: [256]u8 = undefined;
+        if (routing_key_len > routing_key_buf.len) return error.RoutingKeyTooLong;
+        try reader.readNoEof(routing_key_buf[0..routing_key_len]);
+        const routing_key = routing_key_buf[0..routing_key_len];
+
+        // Read flags
+        const flags = try reader.readInt(u8, .big);
+        const mandatory = (flags & 0x01) != 0;
+        const immediate = (flags & 0x02) != 0;
+
+        // Get exchange (use default exchange if empty name)
+        const exchange = vhost.getExchange(exchange_name) orelse {
+            std.log.warn("Basic.Publish to non-existent exchange '{s}' on connection {}", .{ exchange_name, connection.id });
+            if (mandatory) {
+                // TODO: Send Basic.Return for mandatory message to non-existent exchange
+                return error.ExchangeNotFound;
+            }
+            return; // Silently drop non-mandatory message
+        };
+
+        // TODO: Store message content (will be provided in subsequent content header/body frames)
+        // For now, just validate and log the publish request
+        
+        // TODO: Handle immediate flag
+        // TODO: Route message through exchange
+        _ = exchange;
+        
+        std.log.debug("Basic.Publish received: exchange={s}, routing_key={s}, mandatory={}, immediate={}", 
+                     .{ exchange_name, routing_key, mandatory, immediate });
+    }
+
+    fn handleBasicConsume(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        // Check if channel exists
+        const channel = connection.getChannel(channel_id) orelse {
+            std.log.warn("Basic.Consume on non-existent channel {} on connection {}", .{ channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
+
+        if (!channel.active) {
+            return error.ChannelNotActive;
+        }
+
+        // Get virtual host
+        const vhost = self.getVirtualHost(connection) orelse {
+            std.log.warn("Basic.Consume on connection {} with no virtual host", .{connection.id});
+            return error.NoVirtualHost;
+        };
+
+        if (payload.len < 3) return error.InvalidBasicConsume;
+
+        var stream = std.io.fixedBufferStream(payload);
+        const reader = stream.reader();
+
+        // Parse Basic.Consume parameters
+        _ = try reader.readInt(u16, .big); // reserved
+
+        // Read queue name
+        const queue_len = try reader.readInt(u8, .big);
+        var queue_buf: [256]u8 = undefined;
+        if (queue_len > queue_buf.len) return error.QueueNameTooLong;
+        try reader.readNoEof(queue_buf[0..queue_len]);
+        const queue_name = queue_buf[0..queue_len];
+
+        // Read consumer tag
+        const consumer_tag_len = try reader.readInt(u8, .big);
+        var consumer_tag_buf: [256]u8 = undefined;
+        if (consumer_tag_len > consumer_tag_buf.len) return error.ConsumerTagTooLong;
+        try reader.readNoEof(consumer_tag_buf[0..consumer_tag_len]);
+        const consumer_tag = consumer_tag_buf[0..consumer_tag_len];
+
+        // Read flags
+        const flags = try reader.readInt(u8, .big);
+        const no_local = (flags & 0x01) != 0;
+        const no_ack = (flags & 0x02) != 0;
+        const exclusive = (flags & 0x04) != 0;
+        const no_wait = (flags & 0x08) != 0;
+
+        // TODO: Read arguments field table (for now skip)
+
+        // Get queue
+        const queue = vhost.getQueue(queue_name) orelse {
+            std.log.warn("Basic.Consume on non-existent queue '{s}' on connection {}", .{ queue_name, connection.id });
+            return error.QueueNotFound;
+        };
+
+        _ = queue; // TODO: Register consumer with queue
+        _ = no_local;
+        _ = exclusive;
+
+        if (!no_wait) {
+            // Send Basic.ConsumeOk response
+            var response_buf = std.ArrayList(u8).init(self.allocator);
+            defer response_buf.deinit();
+
+            try response_buf.writer().writeInt(u16, 60, .big); // class=60 (Basic)
+            try response_buf.writer().writeInt(u16, 21, .big); // method=21 (ConsumeOk)
+            
+            // Consumer tag
+            try response_buf.writer().writeInt(u8, @intCast(consumer_tag.len), .big);
+            try response_buf.appendSlice(consumer_tag);
+
+            const response_frame = Frame{
+                .frame_type = .method,
+                .channel_id = channel_id,
+                .payload = try self.allocator.dupe(u8, response_buf.items),
+            };
+            defer self.allocator.free(response_frame.payload);
+
+            try connection.sendFrame(response_frame);
+            std.log.debug("Basic.ConsumeOk sent to connection {}, channel {}: consumer_tag={s}", 
+                         .{ connection.id, channel_id, consumer_tag });
+        }
+
+        std.log.debug("Basic.Consume processed: queue={s}, consumer_tag={s}, no_ack={}", 
+                     .{ queue_name, consumer_tag, no_ack });
+    }
+
+    fn handleBasicAck(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        _ = self;
+        
+        // Check if channel exists
+        const channel = connection.getChannel(channel_id) orelse {
+            std.log.warn("Basic.Ack on non-existent channel {} on connection {}", .{ channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
+
+        if (!channel.active) {
+            return error.ChannelNotActive;
+        }
+
+        if (payload.len < 9) return error.InvalidBasicAck;
+
+        var stream = std.io.fixedBufferStream(payload);
+        const reader = stream.reader();
+
+        const delivery_tag = try reader.readInt(u64, .big);
+        const multiple = (try reader.readInt(u8, .big)) & 0x01 != 0;
+
+        // Acknowledge message(s)
+        channel.ackMessage(delivery_tag, multiple);
+
+        std.log.debug("Basic.Ack processed: delivery_tag={}, multiple={}", .{ delivery_tag, multiple });
+    }
+
+    fn handleBasicNack(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        _ = self;
+        
+        // Check if channel exists
+        const channel = connection.getChannel(channel_id) orelse {
+            std.log.warn("Basic.Nack on non-existent channel {} on connection {}", .{ channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
+
+        if (!channel.active) {
+            return error.ChannelNotActive;
+        }
+
+        if (payload.len < 10) return error.InvalidBasicNack;
+
+        var stream = std.io.fixedBufferStream(payload);
+        const reader = stream.reader();
+
+        const delivery_tag = try reader.readInt(u64, .big);
+        const flags = try reader.readInt(u8, .big);
+        const multiple = (flags & 0x01) != 0;
+        const requeue = (flags & 0x02) != 0;
+
+        if (requeue) {
+            // TODO: Requeue message(s) back to queue
+            std.log.debug("Basic.Nack with requeue: delivery_tag={}, multiple={}", .{ delivery_tag, multiple });
+        } else {
+            // Reject message(s) without requeuing (discard)
+            channel.ackMessage(delivery_tag, multiple);
+            std.log.debug("Basic.Nack without requeue: delivery_tag={}, multiple={}", .{ delivery_tag, multiple });
+        }
+    }
+
+    // Stub implementations for other basic methods
+    fn handleBasicCancel(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
         _ = self;
         _ = connection;
+        _ = channel_id;
         _ = payload;
+        std.log.debug("Basic.Cancel not yet implemented", .{});
+    }
 
-        // TODO: Implement basic methods (Publish, Consume, Ack, Nack, etc.)
-        std.log.debug("Basic method not yet implemented: channel={}, method={}", .{ channel_id, method_id });
+    fn handleBasicReturn(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        _ = self;
+        _ = connection;
+        _ = channel_id;
+        _ = payload;
+        std.log.debug("Basic.Return not yet implemented", .{});
+    }
+
+    fn handleBasicDeliver(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        _ = self;
+        _ = connection;
+        _ = channel_id;
+        _ = payload;
+        std.log.debug("Basic.Deliver not yet implemented", .{});
+    }
+
+    fn handleBasicGet(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        _ = self;
+        _ = connection;
+        _ = channel_id;
+        _ = payload;
+        std.log.debug("Basic.Get not yet implemented", .{});
+    }
+
+    fn handleBasicReject(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        _ = self;
+        _ = connection;
+        _ = channel_id;
+        _ = payload;
+        std.log.debug("Basic.Reject not yet implemented", .{});
+    }
+
+    fn handleBasicRecoverAsync(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        _ = self;
+        _ = connection;
+        _ = channel_id;
+        _ = payload;
+        std.log.debug("Basic.RecoverAsync not yet implemented", .{});
+    }
+
+    fn handleBasicRecover(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        _ = self;
+        _ = connection;
+        _ = channel_id;
+        _ = payload;
+        std.log.debug("Basic.Recover not yet implemented", .{});
     }
 
     fn handleHeaderFrame(self: *ProtocolHandler, connection: *Connection, frame: Frame) !void {

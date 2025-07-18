@@ -17,7 +17,7 @@ pub const Server = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Server {
         const protocol_handler = ProtocolHandler.init(allocator);
-        
+
         var server = Server{
             .allocator = allocator,
             .config = config,
@@ -32,7 +32,7 @@ pub const Server = struct {
 
         // Create default virtual host
         try server.createVirtualHost("/");
-        
+
         // Note: Virtual host integration will be handled within the protocol handler
         // using the connection's setVirtualHost method
 
@@ -185,8 +185,6 @@ pub const Server = struct {
         };
     }
 
-
-
     fn removeConnection(self: *Server, connection: *NetworkConnection) void {
         for (self.connections.items, 0..) |conn, i| {
             if (conn.id == connection.id) {
@@ -211,7 +209,6 @@ pub const Server = struct {
     pub fn getVirtualHost(self: *Server, name: []const u8) ?*VirtualHost {
         return self.vhosts.get(name);
     }
-    
 
     pub fn getConnectionCount(self: *const Server) u32 {
         return @intCast(self.connections.items.len);
@@ -231,7 +228,6 @@ pub const Server = struct {
 
         return std.json.Value{ .object = stats };
     }
-
 };
 
 test "server creation and basic operations" {
