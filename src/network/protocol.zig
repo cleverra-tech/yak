@@ -106,8 +106,11 @@ pub const ProtocolHandler = struct {
         // Version minor (9)
         try payload.append(9);
 
-        // Server properties (simplified - empty table for now)
-        try payload.appendSlice(&std.mem.toBytes(@as(u32, 0))); // Empty field table
+        // Server properties (AMQP field table)
+        const properties_data = try self.encodeFieldTable(self.server_properties);
+        defer self.allocator.free(properties_data);
+        try payload.appendSlice(&std.mem.toBytes(@as(u32, @intCast(properties_data.len))));
+        try payload.appendSlice(properties_data);
 
         // Mechanisms (PLAIN)
         const mechanisms = "PLAIN";
@@ -388,6 +391,30 @@ pub const ProtocolHandler = struct {
 
         std.log.debug("Heartbeat handled for connection {}", .{connection.id});
     }
+
+    fn encodeFieldTable(self: *ProtocolHandler, table: std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage)) ![]u8 {
+        var buffer = std.ArrayList(u8).init(self.allocator);
+        defer buffer.deinit();
+
+        var iterator = table.iterator();
+        while (iterator.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const value = entry.value_ptr.*;
+
+            // Write key (short string)
+            try buffer.append(@intCast(key.len));
+            try buffer.appendSlice(key);
+
+            // Write value type (long string = 'S')
+            try buffer.append('S');
+
+            // Write value length and data
+            try buffer.appendSlice(&std.mem.toBytes(@as(u32, @intCast(value.len))));
+            try buffer.appendSlice(value);
+        }
+
+        return buffer.toOwnedSlice();
+    }
 };
 
 test "protocol handler creation" {
@@ -401,4 +428,21 @@ test "protocol handler creation" {
     // Check that server properties are set
     try std.testing.expect(handler.server_properties.contains("product"));
     try std.testing.expect(handler.server_properties.contains("version"));
+}
+
+test "field table encoding" {
+    const allocator = std.testing.allocator;
+
+    var handler = ProtocolHandler.init(allocator);
+    defer handler.deinit();
+
+    const encoded = try handler.encodeFieldTable(handler.server_properties);
+    defer allocator.free(encoded);
+
+    // Field table should not be empty
+    try std.testing.expect(encoded.len > 0);
+
+    // Should contain encoded key-value pairs
+    // Format: key_len + key + 'S' + value_len(4 bytes) + value
+    try std.testing.expect(encoded.len > 10); // At least one meaningful entry
 }
