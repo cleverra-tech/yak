@@ -704,12 +704,460 @@ pub const ProtocolHandler = struct {
     }
 
     fn handleQueueMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
-        _ = self;
-        _ = connection;
-        _ = payload;
+        switch (method_id) {
+            10 => try self.handleQueueDeclare(connection, channel_id, payload), // Declare
+            20 => try self.handleQueueBind(connection, channel_id, payload), // Bind
+            30 => try self.handleQueuePurge(connection, channel_id, payload), // Purge
+            40 => try self.handleQueueDelete(connection, channel_id, payload), // Delete
+            50 => try self.handleQueueUnbind(connection, channel_id, payload), // Unbind
+            else => {
+                std.log.warn("Unknown queue method {} on connection {}, channel {}", .{ method_id, connection.id, channel_id });
+                return error.UnknownQueueMethod;
+            },
+        }
+    }
 
-        // TODO: Implement queue methods (Declare, Delete, Bind, Purge, etc.)
-        std.log.debug("Queue method not yet implemented: channel={}, method={}", .{ channel_id, method_id });
+    fn handleQueueDeclare(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        if (payload.len < 3) {
+            return error.InvalidQueueDeclare;
+        }
+
+        var reader = std.io.fixedBufferStream(payload).reader();
+
+        // Skip reserved field
+        _ = try reader.readInt(u16, .big);
+
+        // Read queue name
+        const name_len = try reader.readInt(u8, .big);
+        var name_buf: [256]u8 = undefined;
+        if (name_len > name_buf.len) return error.QueueNameTooLong;
+        try reader.readNoEof(name_buf[0..name_len]);
+        const queue_name = name_buf[0..name_len];
+
+        // Read flags
+        const flags = try reader.readInt(u8, .big);
+        const passive = (flags & 0x01) != 0;
+        const durable = (flags & 0x02) != 0;
+        const exclusive = (flags & 0x04) != 0;
+        const auto_delete = (flags & 0x08) != 0;
+        const no_wait = (flags & 0x10) != 0;
+
+        // Read arguments (field table)
+        const args_len = try reader.readInt(u32, .big);
+        var arguments: ?[]const u8 = null;
+        if (args_len > 0) {
+            var args_buf = try self.allocator.alloc(u8, args_len);
+            try reader.readNoEof(args_buf);
+            arguments = args_buf;
+        }
+        defer if (arguments) |args| self.allocator.free(args);
+
+        // Get virtual host
+        const vhost = self.getVirtualHost(connection) orelse {
+            std.log.warn("Queue.Declare on connection {} with no virtual host", .{connection.id});
+            return error.NoVirtualHost;
+        };
+
+        // Check if channel exists
+        const channel = connection.getChannel(channel_id) orelse {
+            std.log.warn("Queue.Declare on non-existent channel {} on connection {}", .{ channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
+
+        if (!channel.active) {
+            return error.ChannelNotActive;
+        }
+
+        // Declare queue
+        var actual_queue_name: []const u8 = undefined;
+        if (passive) {
+            // Passive declare - just check if queue exists
+            if (vhost.getQueue(queue_name) == null) {
+                return error.QueueNotFound;
+            }
+            actual_queue_name = queue_name;
+        } else {
+            // Active declare - create queue
+            actual_queue_name = vhost.declareQueue(queue_name, durable, exclusive, auto_delete, arguments) catch |err| switch (err) {
+                error.QueueParameterMismatch => return error.QueueParameterMismatch,
+                else => return err,
+            };
+        }
+
+        // Send Queue.DeclareOk if not no_wait
+        if (!no_wait) {
+            try self.sendQueueDeclareOk(connection, channel_id, actual_queue_name);
+        }
+
+        std.log.debug("Queue.Declare handled for connection {}, channel {}: {s}", .{ connection.id, channel_id, actual_queue_name });
+    }
+
+    fn sendQueueDeclareOk(self: *ProtocolHandler, connection: *Connection, channel_id: u16, queue_name: []const u8) !void {
+        var payload = std.ArrayList(u8).init(self.allocator);
+        defer payload.deinit();
+
+        // Class ID (Queue = 50)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 50)));
+        // Method ID (DeclareOk = 11)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 11)));
+
+        // Queue name
+        try payload.append(@intCast(queue_name.len));
+        try payload.appendSlice(queue_name);
+
+        // Message count (placeholder - would need actual count from queue)
+        try payload.appendSlice(&std.mem.toBytes(@as(u32, 0)));
+
+        // Consumer count (placeholder - would need actual count from queue)
+        try payload.appendSlice(&std.mem.toBytes(@as(u32, 0)));
+
+        const frame = Frame{
+            .frame_type = .method,
+            .channel = channel_id,
+            .payload = try self.allocator.dupe(u8, payload.items),
+        };
+        defer self.allocator.free(frame.payload);
+
+        try connection.sendFrame(frame);
+        std.log.debug("Queue.DeclareOk sent to connection {}, channel {}: {s}", .{ connection.id, channel_id, queue_name });
+    }
+
+    fn handleQueueBind(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        if (payload.len < 4) {
+            return error.InvalidQueueBind;
+        }
+
+        var reader = std.io.fixedBufferStream(payload).reader();
+
+        // Skip reserved field
+        _ = try reader.readInt(u16, .big);
+
+        // Read queue name
+        const queue_name_len = try reader.readInt(u8, .big);
+        var queue_name_buf: [256]u8 = undefined;
+        if (queue_name_len > queue_name_buf.len) return error.QueueNameTooLong;
+        try reader.readNoEof(queue_name_buf[0..queue_name_len]);
+        const queue_name = queue_name_buf[0..queue_name_len];
+
+        // Read exchange name
+        const exchange_name_len = try reader.readInt(u8, .big);
+        var exchange_name_buf: [256]u8 = undefined;
+        if (exchange_name_len > exchange_name_buf.len) return error.ExchangeNameTooLong;
+        try reader.readNoEof(exchange_name_buf[0..exchange_name_len]);
+        const exchange_name = exchange_name_buf[0..exchange_name_len];
+
+        // Read routing key
+        const routing_key_len = try reader.readInt(u8, .big);
+        var routing_key_buf: [256]u8 = undefined;
+        if (routing_key_len > routing_key_buf.len) return error.RoutingKeyTooLong;
+        try reader.readNoEof(routing_key_buf[0..routing_key_len]);
+        const routing_key = routing_key_buf[0..routing_key_len];
+
+        // Read flags
+        const flags = try reader.readInt(u8, .big);
+        const no_wait = (flags & 0x01) != 0;
+
+        // Read arguments (field table)
+        const args_len = try reader.readInt(u32, .big);
+        var arguments: ?[]const u8 = null;
+        if (args_len > 0) {
+            var args_buf = try self.allocator.alloc(u8, args_len);
+            try reader.readNoEof(args_buf);
+            arguments = args_buf;
+        }
+        defer if (arguments) |args| self.allocator.free(args);
+
+        // Get virtual host
+        const vhost = self.getVirtualHost(connection) orelse {
+            std.log.warn("Queue.Bind on connection {} with no virtual host", .{connection.id});
+            return error.NoVirtualHost;
+        };
+
+        // Check if channel exists
+        const channel = connection.getChannel(channel_id) orelse {
+            std.log.warn("Queue.Bind on non-existent channel {} on connection {}", .{ channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
+
+        if (!channel.active) {
+            return error.ChannelNotActive;
+        }
+
+        // Bind queue to exchange
+        vhost.bindQueue(queue_name, exchange_name, routing_key, arguments) catch |err| switch (err) {
+            error.QueueNotFound => return error.QueueNotFound,
+            error.ExchangeNotFound => return error.ExchangeNotFound,
+            else => return err,
+        };
+
+        // Send Queue.BindOk if not no_wait
+        if (!no_wait) {
+            try self.sendQueueBindOk(connection, channel_id);
+        }
+
+        std.log.debug("Queue.Bind handled for connection {}, channel {}: {s} -> {s} (key: {s})", .{ connection.id, channel_id, exchange_name, queue_name, routing_key });
+    }
+
+    fn sendQueueBindOk(self: *ProtocolHandler, connection: *Connection, channel_id: u16) !void {
+        var payload = std.ArrayList(u8).init(self.allocator);
+        defer payload.deinit();
+
+        // Class ID (Queue = 50)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 50)));
+        // Method ID (BindOk = 21)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 21)));
+
+        const frame = Frame{
+            .frame_type = .method,
+            .channel = channel_id,
+            .payload = try self.allocator.dupe(u8, payload.items),
+        };
+        defer self.allocator.free(frame.payload);
+
+        try connection.sendFrame(frame);
+        std.log.debug("Queue.BindOk sent to connection {}, channel {}", .{ connection.id, channel_id });
+    }
+
+    fn handleQueueUnbind(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        if (payload.len < 4) {
+            return error.InvalidQueueUnbind;
+        }
+
+        var reader = std.io.fixedBufferStream(payload).reader();
+
+        // Skip reserved field
+        _ = try reader.readInt(u16, .big);
+
+        // Read queue name
+        const queue_name_len = try reader.readInt(u8, .big);
+        var queue_name_buf: [256]u8 = undefined;
+        if (queue_name_len > queue_name_buf.len) return error.QueueNameTooLong;
+        try reader.readNoEof(queue_name_buf[0..queue_name_len]);
+        const queue_name = queue_name_buf[0..queue_name_len];
+
+        // Read exchange name
+        const exchange_name_len = try reader.readInt(u8, .big);
+        var exchange_name_buf: [256]u8 = undefined;
+        if (exchange_name_len > exchange_name_buf.len) return error.ExchangeNameTooLong;
+        try reader.readNoEof(exchange_name_buf[0..exchange_name_len]);
+        const exchange_name = exchange_name_buf[0..exchange_name_len];
+
+        // Read routing key
+        const routing_key_len = try reader.readInt(u8, .big);
+        var routing_key_buf: [256]u8 = undefined;
+        if (routing_key_len > routing_key_buf.len) return error.RoutingKeyTooLong;
+        try reader.readNoEof(routing_key_buf[0..routing_key_len]);
+        const routing_key = routing_key_buf[0..routing_key_len];
+
+        // Read arguments (field table)
+        const args_len = try reader.readInt(u32, .big);
+        var arguments: ?[]const u8 = null;
+        if (args_len > 0) {
+            var args_buf = try self.allocator.alloc(u8, args_len);
+            try reader.readNoEof(args_buf);
+            arguments = args_buf;
+        }
+        defer if (arguments) |args| self.allocator.free(args);
+
+        // Get virtual host
+        const vhost = self.getVirtualHost(connection) orelse {
+            std.log.warn("Queue.Unbind on connection {} with no virtual host", .{connection.id});
+            return error.NoVirtualHost;
+        };
+
+        // Check if channel exists
+        const channel = connection.getChannel(channel_id) orelse {
+            std.log.warn("Queue.Unbind on non-existent channel {} on connection {}", .{ channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
+
+        if (!channel.active) {
+            return error.ChannelNotActive;
+        }
+
+        // Unbind queue from exchange
+        vhost.unbindQueue(queue_name, exchange_name, routing_key, arguments) catch |err| switch (err) {
+            error.QueueNotFound => return error.QueueNotFound,
+            error.ExchangeNotFound => return error.ExchangeNotFound,
+            else => return err,
+        };
+
+        // Send Queue.UnbindOk
+        try self.sendQueueUnbindOk(connection, channel_id);
+
+        std.log.debug("Queue.Unbind handled for connection {}, channel {}: {s} -/-> {s} (key: {s})", .{ connection.id, channel_id, exchange_name, queue_name, routing_key });
+    }
+
+    fn sendQueueUnbindOk(self: *ProtocolHandler, connection: *Connection, channel_id: u16) !void {
+        var payload = std.ArrayList(u8).init(self.allocator);
+        defer payload.deinit();
+
+        // Class ID (Queue = 50)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 50)));
+        // Method ID (UnbindOk = 51)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 51)));
+
+        const frame = Frame{
+            .frame_type = .method,
+            .channel = channel_id,
+            .payload = try self.allocator.dupe(u8, payload.items),
+        };
+        defer self.allocator.free(frame.payload);
+
+        try connection.sendFrame(frame);
+        std.log.debug("Queue.UnbindOk sent to connection {}, channel {}", .{ connection.id, channel_id });
+    }
+
+    fn handleQueuePurge(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        if (payload.len < 3) {
+            return error.InvalidQueuePurge;
+        }
+
+        var reader = std.io.fixedBufferStream(payload).reader();
+
+        // Skip reserved field
+        _ = try reader.readInt(u16, .big);
+
+        // Read queue name
+        const name_len = try reader.readInt(u8, .big);
+        var name_buf: [256]u8 = undefined;
+        if (name_len > name_buf.len) return error.QueueNameTooLong;
+        try reader.readNoEof(name_buf[0..name_len]);
+        const queue_name = name_buf[0..name_len];
+
+        // Read flags
+        const flags = try reader.readInt(u8, .big);
+        const no_wait = (flags & 0x01) != 0;
+
+        // Get virtual host
+        const vhost = self.getVirtualHost(connection) orelse {
+            std.log.warn("Queue.Purge on connection {} with no virtual host", .{connection.id});
+            return error.NoVirtualHost;
+        };
+
+        // Check if channel exists
+        const channel = connection.getChannel(channel_id) orelse {
+            std.log.warn("Queue.Purge on non-existent channel {} on connection {}", .{ channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
+
+        if (!channel.active) {
+            return error.ChannelNotActive;
+        }
+
+        // Purge queue
+        const message_count = vhost.purgeQueue(queue_name) catch |err| switch (err) {
+            error.QueueNotFound => return error.QueueNotFound,
+            else => return err,
+        };
+
+        // Send Queue.PurgeOk if not no_wait
+        if (!no_wait) {
+            try self.sendQueuePurgeOk(connection, channel_id, message_count);
+        }
+
+        std.log.debug("Queue.Purge handled for connection {}, channel {}: {s} ({} messages)", .{ connection.id, channel_id, queue_name, message_count });
+    }
+
+    fn sendQueuePurgeOk(self: *ProtocolHandler, connection: *Connection, channel_id: u16, message_count: u32) !void {
+        var payload = std.ArrayList(u8).init(self.allocator);
+        defer payload.deinit();
+
+        // Class ID (Queue = 50)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 50)));
+        // Method ID (PurgeOk = 31)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 31)));
+
+        // Message count
+        try payload.appendSlice(&std.mem.toBytes(message_count));
+
+        const frame = Frame{
+            .frame_type = .method,
+            .channel = channel_id,
+            .payload = try self.allocator.dupe(u8, payload.items),
+        };
+        defer self.allocator.free(frame.payload);
+
+        try connection.sendFrame(frame);
+        std.log.debug("Queue.PurgeOk sent to connection {}, channel {}: {} messages", .{ connection.id, channel_id, message_count });
+    }
+
+    fn handleQueueDelete(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        if (payload.len < 3) {
+            return error.InvalidQueueDelete;
+        }
+
+        var reader = std.io.fixedBufferStream(payload).reader();
+
+        // Skip reserved field
+        _ = try reader.readInt(u16, .big);
+
+        // Read queue name
+        const name_len = try reader.readInt(u8, .big);
+        var name_buf: [256]u8 = undefined;
+        if (name_len > name_buf.len) return error.QueueNameTooLong;
+        try reader.readNoEof(name_buf[0..name_len]);
+        const queue_name = name_buf[0..name_len];
+
+        // Read flags
+        const flags = try reader.readInt(u8, .big);
+        const if_unused = (flags & 0x01) != 0;
+        const if_empty = (flags & 0x02) != 0;
+        const no_wait = (flags & 0x04) != 0;
+
+        // Get virtual host
+        const vhost = self.getVirtualHost(connection) orelse {
+            std.log.warn("Queue.Delete on connection {} with no virtual host", .{connection.id});
+            return error.NoVirtualHost;
+        };
+
+        // Check if channel exists
+        const channel = connection.getChannel(channel_id) orelse {
+            std.log.warn("Queue.Delete on non-existent channel {} on connection {}", .{ channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
+
+        if (!channel.active) {
+            return error.ChannelNotActive;
+        }
+
+        // Delete queue
+        const message_count = vhost.deleteQueue(queue_name, if_unused, if_empty) catch |err| switch (err) {
+            error.QueueNotFound => return error.QueueNotFound,
+            error.QueueInUse => return error.QueueInUse,
+            error.QueueNotEmpty => return error.QueueNotEmpty,
+            else => return err,
+        };
+
+        // Send Queue.DeleteOk if not no_wait
+        if (!no_wait) {
+            try self.sendQueueDeleteOk(connection, channel_id, message_count);
+        }
+
+        std.log.debug("Queue.Delete handled for connection {}, channel {}: {s} ({} messages)", .{ connection.id, channel_id, queue_name, message_count });
+    }
+
+    fn sendQueueDeleteOk(self: *ProtocolHandler, connection: *Connection, channel_id: u16, message_count: u32) !void {
+        var payload = std.ArrayList(u8).init(self.allocator);
+        defer payload.deinit();
+
+        // Class ID (Queue = 50)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 50)));
+        // Method ID (DeleteOk = 41)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 41)));
+
+        // Message count
+        try payload.appendSlice(&std.mem.toBytes(message_count));
+
+        const frame = Frame{
+            .frame_type = .method,
+            .channel = channel_id,
+            .payload = try self.allocator.dupe(u8, payload.items),
+        };
+        defer self.allocator.free(frame.payload);
+
+        try connection.sendFrame(frame);
+        std.log.debug("Queue.DeleteOk sent to connection {}, channel {}: {} messages", .{ connection.id, channel_id, message_count });
     }
 
     fn handleBasicMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
@@ -987,4 +1435,170 @@ test "exchange method error handling" {
     try connection.addChannel(1);
     const result_invalid = handler.handleExchangeDeclare(&connection, 1, &empty_payload);
     try std.testing.expectError(error.InvalidExchangeDeclare, result_invalid);
+}
+
+test "queue method handling" {
+    const allocator = std.testing.allocator;
+
+    var handler = ProtocolHandler.init(allocator);
+    defer handler.deinit();
+
+    // Create a test virtual host
+    var vhost = try VirtualHost.init(allocator, "test-vhost");
+    defer vhost.deinit();
+
+    // Mock VirtualHost getter function
+    const TestVHost = struct {
+        var test_vhost: *VirtualHost = undefined;
+
+        fn getVHost(vhost_name: []const u8) ?*VirtualHost {
+            _ = vhost_name;
+            return test_vhost;
+        }
+    };
+
+    TestVHost.test_vhost = &vhost;
+    handler.setVirtualHostGetter(TestVHost.getVHost);
+
+    // Create a mock connection
+    const mock_socket = std.net.Stream{ .handle = 0 };
+    var connection = try Connection.init(allocator, 1, mock_socket);
+    defer connection.deinit();
+
+    connection.setState(.open);
+    try connection.setVirtualHost("test-vhost");
+
+    // Create a channel
+    try connection.addChannel(1);
+
+    // Test Queue.Declare - create a simple payload
+    var declare_payload = std.ArrayList(u8).init(allocator);
+    defer declare_payload.deinit();
+
+    // Reserved field
+    try declare_payload.appendSlice(&std.mem.toBytes(@as(u16, 0)));
+    // Queue name "test-queue"
+    const queue_name = "test-queue";
+    try declare_payload.append(@intCast(queue_name.len));
+    try declare_payload.appendSlice(queue_name);
+    // Flags: durable=true (0x02)
+    try declare_payload.append(0x02);
+    // Arguments (empty field table)
+    try declare_payload.appendSlice(&std.mem.toBytes(@as(u32, 0)));
+
+    // This should succeed and create the queue
+    try handler.handleQueueDeclare(&connection, 1, declare_payload.items);
+
+    // Verify queue was created
+    const queue = vhost.getQueue("test-queue");
+    try std.testing.expect(queue != null);
+    try std.testing.expectEqual(true, queue.?.durable);
+
+    // Test Queue.Bind - bind queue to default exchange
+    var bind_payload = std.ArrayList(u8).init(allocator);
+    defer bind_payload.deinit();
+
+    // Reserved field
+    try bind_payload.appendSlice(&std.mem.toBytes(@as(u16, 0)));
+    // Queue name "test-queue"
+    try bind_payload.append(@intCast(queue_name.len));
+    try bind_payload.appendSlice(queue_name);
+    // Exchange name "" (default exchange)
+    const exchange_name = "";
+    try bind_payload.append(@intCast(exchange_name.len));
+    try bind_payload.appendSlice(exchange_name);
+    // Routing key "test-key"
+    const routing_key = "test-key";
+    try bind_payload.append(@intCast(routing_key.len));
+    try bind_payload.appendSlice(routing_key);
+    // Flags: none
+    try bind_payload.append(0x00);
+    // Arguments (empty field table)
+    try bind_payload.appendSlice(&std.mem.toBytes(@as(u32, 0)));
+
+    // This should succeed and bind the queue
+    try handler.handleQueueBind(&connection, 1, bind_payload.items);
+
+    // Test Queue.Purge
+    var purge_payload = std.ArrayList(u8).init(allocator);
+    defer purge_payload.deinit();
+
+    // Reserved field
+    try purge_payload.appendSlice(&std.mem.toBytes(@as(u16, 0)));
+    // Queue name "test-queue"
+    try purge_payload.append(@intCast(queue_name.len));
+    try purge_payload.appendSlice(queue_name);
+    // Flags: none
+    try purge_payload.append(0x00);
+
+    // This should succeed and purge the queue (0 messages)
+    try handler.handleQueuePurge(&connection, 1, purge_payload.items);
+
+    // Test Queue.Unbind
+    var unbind_payload = std.ArrayList(u8).init(allocator);
+    defer unbind_payload.deinit();
+
+    // Reserved field
+    try unbind_payload.appendSlice(&std.mem.toBytes(@as(u16, 0)));
+    // Queue name "test-queue"
+    try unbind_payload.append(@intCast(queue_name.len));
+    try unbind_payload.appendSlice(queue_name);
+    // Exchange name "" (default exchange)
+    try unbind_payload.append(@intCast(exchange_name.len));
+    try unbind_payload.appendSlice(exchange_name);
+    // Routing key "test-key"
+    try unbind_payload.append(@intCast(routing_key.len));
+    try unbind_payload.appendSlice(routing_key);
+    // Arguments (empty field table)
+    try unbind_payload.appendSlice(&std.mem.toBytes(@as(u32, 0)));
+
+    // This should succeed and unbind the queue
+    try handler.handleQueueUnbind(&connection, 1, unbind_payload.items);
+
+    // Test Queue.Delete
+    var delete_payload = std.ArrayList(u8).init(allocator);
+    defer delete_payload.deinit();
+
+    // Reserved field
+    try delete_payload.appendSlice(&std.mem.toBytes(@as(u16, 0)));
+    // Queue name "test-queue"
+    try delete_payload.append(@intCast(queue_name.len));
+    try delete_payload.appendSlice(queue_name);
+    // Flags: none
+    try delete_payload.append(0x00);
+
+    // This should succeed and delete the queue
+    try handler.handleQueueDelete(&connection, 1, delete_payload.items);
+
+    // Verify queue was deleted
+    const deleted_queue = vhost.getQueue("test-queue");
+    try std.testing.expect(deleted_queue == null);
+}
+
+test "queue method error handling" {
+    const allocator = std.testing.allocator;
+
+    var handler = ProtocolHandler.init(allocator);
+    defer handler.deinit();
+
+    const mock_socket = std.net.Stream{ .handle = 0 };
+    var connection = try Connection.init(allocator, 1, mock_socket);
+    defer connection.deinit();
+
+    connection.setState(.open);
+
+    // Test with no virtual host
+    const empty_payload = [_]u8{};
+    const result_no_vhost = handler.handleQueueDeclare(&connection, 1, &empty_payload);
+    try std.testing.expectError(error.NoVirtualHost, result_no_vhost);
+
+    // Test with non-existent channel
+    try connection.setVirtualHost("test-vhost");
+    const result_no_channel = handler.handleQueueDeclare(&connection, 99, &empty_payload);
+    try std.testing.expectError(error.ChannelNotFound, result_no_channel);
+
+    // Test with invalid payload
+    try connection.addChannel(1);
+    const result_invalid = handler.handleQueueDeclare(&connection, 1, &empty_payload);
+    try std.testing.expectError(error.InvalidQueueDeclare, result_invalid);
 }
