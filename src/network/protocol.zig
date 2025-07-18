@@ -6,15 +6,18 @@ const FrameType = @import("../protocol/frame.zig").FrameType;
 const Method = @import("../protocol/methods.zig").Method;
 const MethodClass = @import("../protocol/methods.zig").MethodClass;
 const VirtualHost = @import("../core/vhost.zig").VirtualHost;
+const ExchangeType = @import("../routing/exchange.zig").ExchangeType;
 
 pub const ProtocolHandler = struct {
     allocator: std.mem.Allocator,
     server_properties: std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
+    get_vhost_fn: ?*const fn (vhost_name: []const u8) ?*VirtualHost,
 
     pub fn init(allocator: std.mem.Allocator) ProtocolHandler {
         var handler = ProtocolHandler{
             .allocator = allocator,
             .server_properties = std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .get_vhost_fn = null,
         };
 
         // Initialize server properties
@@ -32,6 +35,16 @@ pub const ProtocolHandler = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.server_properties.deinit();
+    }
+
+    pub fn setVirtualHostGetter(self: *ProtocolHandler, get_vhost_fn: *const fn (vhost_name: []const u8) ?*VirtualHost) void {
+        self.get_vhost_fn = get_vhost_fn;
+    }
+
+    fn getVirtualHost(self: *ProtocolHandler, connection: *Connection) ?*VirtualHost {
+        const vhost_name = connection.virtual_host orelse return null;
+        const get_fn = self.get_vhost_fn orelse return null;
+        return get_fn(vhost_name);
     }
 
     fn initServerProperties(self: *ProtocolHandler) !void {
@@ -469,12 +482,225 @@ pub const ProtocolHandler = struct {
     }
 
     fn handleExchangeMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
+        switch (method_id) {
+            10 => try self.handleExchangeDeclare(connection, channel_id, payload), // Declare
+            20 => try self.handleExchangeDelete(connection, channel_id, payload), // Delete
+            30 => try self.handleExchangeBind(connection, channel_id, payload), // Bind
+            40 => try self.handleExchangeUnbind(connection, channel_id, payload), // Unbind
+            else => {
+                std.log.warn("Unknown exchange method {} on connection {}, channel {}", .{ method_id, connection.id, channel_id });
+                return error.UnknownExchangeMethod;
+            },
+        }
+    }
+
+    fn handleExchangeDeclare(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        if (payload.len < 3) {
+            return error.InvalidExchangeDeclare;
+        }
+
+        var reader = std.io.fixedBufferStream(payload).reader();
+
+        // Skip reserved field
+        _ = try reader.readInt(u16, .big);
+
+        // Read exchange name
+        const name_len = try reader.readInt(u8, .big);
+        var name_buf: [256]u8 = undefined;
+        if (name_len > name_buf.len) return error.ExchangeNameTooLong;
+        try reader.readNoEof(name_buf[0..name_len]);
+        const exchange_name = name_buf[0..name_len];
+
+        // Read exchange type
+        const type_len = try reader.readInt(u8, .big);
+        var type_buf: [16]u8 = undefined;
+        if (type_len > type_buf.len) return error.ExchangeTypeTooLong;
+        try reader.readNoEof(type_buf[0..type_len]);
+        const type_str = type_buf[0..type_len];
+
+        // Parse exchange type
+        const exchange_type = if (std.mem.eql(u8, type_str, "direct"))
+            ExchangeType.direct
+        else if (std.mem.eql(u8, type_str, "fanout"))
+            ExchangeType.fanout
+        else if (std.mem.eql(u8, type_str, "topic"))
+            ExchangeType.topic
+        else if (std.mem.eql(u8, type_str, "headers"))
+            ExchangeType.headers
+        else
+            return error.UnsupportedExchangeType;
+
+        // Read flags
+        const flags = try reader.readInt(u8, .big);
+        const passive = (flags & 0x01) != 0;
+        const durable = (flags & 0x02) != 0;
+        const auto_delete = (flags & 0x04) != 0;
+        const internal = (flags & 0x08) != 0;
+        const no_wait = (flags & 0x10) != 0;
+
+        // Read arguments (field table)
+        const args_len = try reader.readInt(u32, .big);
+        var arguments: ?[]const u8 = null;
+        if (args_len > 0) {
+            var args_buf = try self.allocator.alloc(u8, args_len);
+            try reader.readNoEof(args_buf);
+            arguments = args_buf;
+        }
+        defer if (arguments) |args| self.allocator.free(args);
+
+        // Get virtual host
+        const vhost = self.getVirtualHost(connection) orelse {
+            std.log.warn("Exchange.Declare on connection {} with no virtual host", .{connection.id});
+            return error.NoVirtualHost;
+        };
+
+        // Check if channel exists
+        const channel = connection.getChannel(channel_id) orelse {
+            std.log.warn("Exchange.Declare on non-existent channel {} on connection {}", .{ channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
+
+        if (!channel.active) {
+            return error.ChannelNotActive;
+        }
+
+        // Declare exchange
+        if (passive) {
+            // Passive declare - just check if exchange exists
+            if (vhost.getExchange(exchange_name) == null) {
+                return error.ExchangeNotFound;
+            }
+        } else {
+            // Active declare - create exchange
+            vhost.declareExchange(exchange_name, exchange_type, durable, auto_delete, internal, arguments) catch |err| switch (err) {
+                error.ExchangeParameterMismatch => return error.ExchangeParameterMismatch,
+                else => return err,
+            };
+        }
+
+        // Send Exchange.DeclareOk if not no_wait
+        if (!no_wait) {
+            try self.sendExchangeDeclareOk(connection, channel_id);
+        }
+
+        std.log.debug("Exchange.Declare handled for connection {}, channel {}: {s} (type: {s})", .{ connection.id, channel_id, exchange_name, @tagName(exchange_type) });
+    }
+
+    fn sendExchangeDeclareOk(self: *ProtocolHandler, connection: *Connection, channel_id: u16) !void {
+        var payload = std.ArrayList(u8).init(self.allocator);
+        defer payload.deinit();
+
+        // Class ID (Exchange = 40)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 40)));
+        // Method ID (DeclareOk = 11)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 11)));
+
+        const frame = Frame{
+            .frame_type = .method,
+            .channel = channel_id,
+            .payload = try self.allocator.dupe(u8, payload.items),
+        };
+        defer self.allocator.free(frame.payload);
+
+        try connection.sendFrame(frame);
+        std.log.debug("Exchange.DeclareOk sent to connection {}, channel {}", .{ connection.id, channel_id });
+    }
+
+    fn handleExchangeDelete(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        if (payload.len < 4) {
+            return error.InvalidExchangeDelete;
+        }
+
+        var reader = std.io.fixedBufferStream(payload).reader();
+
+        // Skip reserved field
+        _ = try reader.readInt(u16, .big);
+
+        // Read exchange name
+        const name_len = try reader.readInt(u8, .big);
+        var name_buf: [256]u8 = undefined;
+        if (name_len > name_buf.len) return error.ExchangeNameTooLong;
+        try reader.readNoEof(name_buf[0..name_len]);
+        const exchange_name = name_buf[0..name_len];
+
+        // Read flags
+        const flags = try reader.readInt(u8, .big);
+        const if_unused = (flags & 0x01) != 0;
+        const no_wait = (flags & 0x02) != 0;
+
+        // Get virtual host
+        const vhost = self.getVirtualHost(connection) orelse {
+            std.log.warn("Exchange.Delete on connection {} with no virtual host", .{connection.id});
+            return error.NoVirtualHost;
+        };
+
+        // Check if channel exists
+        const channel = connection.getChannel(channel_id) orelse {
+            std.log.warn("Exchange.Delete on non-existent channel {} on connection {}", .{ channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
+
+        if (!channel.active) {
+            return error.ChannelNotActive;
+        }
+
+        // Delete exchange
+        vhost.deleteExchange(exchange_name, if_unused) catch |err| switch (err) {
+            error.ExchangeNotFound => return error.ExchangeNotFound,
+            error.ExchangeInUse => return error.ExchangeInUse,
+            else => return err,
+        };
+
+        // Send Exchange.DeleteOk if not no_wait
+        if (!no_wait) {
+            try self.sendExchangeDeleteOk(connection, channel_id);
+        }
+
+        std.log.debug("Exchange.Delete handled for connection {}, channel {}: {s}", .{ connection.id, channel_id, exchange_name });
+    }
+
+    fn sendExchangeDeleteOk(self: *ProtocolHandler, connection: *Connection, channel_id: u16) !void {
+        var payload = std.ArrayList(u8).init(self.allocator);
+        defer payload.deinit();
+
+        // Class ID (Exchange = 40)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 40)));
+        // Method ID (DeleteOk = 21)
+        try payload.appendSlice(&std.mem.toBytes(@as(u16, 21)));
+
+        const frame = Frame{
+            .frame_type = .method,
+            .channel = channel_id,
+            .payload = try self.allocator.dupe(u8, payload.items),
+        };
+        defer self.allocator.free(frame.payload);
+
+        try connection.sendFrame(frame);
+        std.log.debug("Exchange.DeleteOk sent to connection {}, channel {}", .{ connection.id, channel_id });
+    }
+
+    fn handleExchangeBind(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
         _ = self;
         _ = connection;
+        _ = channel_id;
         _ = payload;
 
-        // TODO: Implement exchange methods (Declare, Delete, Bind, etc.)
-        std.log.debug("Exchange method not yet implemented: channel={}, method={}", .{ channel_id, method_id });
+        // TODO: Exchange-to-exchange binding is not widely used in AMQP 0-9-1
+        // For now, return an error indicating this is not supported
+        std.log.debug("Exchange.Bind not implemented: exchange-to-exchange binding not supported");
+        return error.ExchangeBindNotSupported;
+    }
+
+    fn handleExchangeUnbind(self: *ProtocolHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
+        _ = self;
+        _ = connection;
+        _ = channel_id;
+        _ = payload;
+
+        // TODO: Exchange-to-exchange unbinding is not widely used in AMQP 0-9-1
+        // For now, return an error indicating this is not supported
+        std.log.debug("Exchange.Unbind not implemented: exchange-to-exchange unbinding not supported");
+        return error.ExchangeUnbindNotSupported;
     }
 
     fn handleQueueMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
@@ -651,4 +877,114 @@ test "channel method error handling" {
     connection.setState(.handshake);
     const result_not_open = handler.handleChannelOpen(&connection, 1, &empty_payload);
     try std.testing.expectError(error.ConnectionNotOpen, result_not_open);
+}
+
+test "exchange method handling" {
+    const allocator = std.testing.allocator;
+
+    var handler = ProtocolHandler.init(allocator);
+    defer handler.deinit();
+
+    // Create a test virtual host
+    var vhost = try VirtualHost.init(allocator, "test-vhost");
+    defer vhost.deinit();
+
+    // Mock VirtualHost getter function
+    const TestVHost = struct {
+        var test_vhost: *VirtualHost = undefined;
+
+        fn getVHost(vhost_name: []const u8) ?*VirtualHost {
+            _ = vhost_name;
+            return test_vhost;
+        }
+    };
+
+    TestVHost.test_vhost = &vhost;
+    handler.setVirtualHostGetter(TestVHost.getVHost);
+
+    // Create a mock connection
+    const mock_socket = std.net.Stream{ .handle = 0 };
+    var connection = try Connection.init(allocator, 1, mock_socket);
+    defer connection.deinit();
+
+    connection.setState(.open);
+    try connection.setVirtualHost("test-vhost");
+
+    // Create a channel
+    try connection.addChannel(1);
+
+    // Test Exchange.Declare - create a simple payload
+    var declare_payload = std.ArrayList(u8).init(allocator);
+    defer declare_payload.deinit();
+
+    // Reserved field
+    try declare_payload.appendSlice(&std.mem.toBytes(@as(u16, 0)));
+    // Exchange name "test-exchange"
+    const exchange_name = "test-exchange";
+    try declare_payload.append(@intCast(exchange_name.len));
+    try declare_payload.appendSlice(exchange_name);
+    // Exchange type "direct"
+    const exchange_type = "direct";
+    try declare_payload.append(@intCast(exchange_type.len));
+    try declare_payload.appendSlice(exchange_type);
+    // Flags: durable=true (0x02)
+    try declare_payload.append(0x02);
+    // Arguments (empty field table)
+    try declare_payload.appendSlice(&std.mem.toBytes(@as(u32, 0)));
+
+    // This should succeed and create the exchange
+    try handler.handleExchangeDeclare(&connection, 1, declare_payload.items);
+
+    // Verify exchange was created
+    const exchange = vhost.getExchange("test-exchange");
+    try std.testing.expect(exchange != null);
+    try std.testing.expectEqual(ExchangeType.direct, exchange.?.exchange_type);
+    try std.testing.expectEqual(true, exchange.?.durable);
+
+    // Test Exchange.Delete
+    var delete_payload = std.ArrayList(u8).init(allocator);
+    defer delete_payload.deinit();
+
+    // Reserved field
+    try delete_payload.appendSlice(&std.mem.toBytes(@as(u16, 0)));
+    // Exchange name "test-exchange"
+    try delete_payload.append(@intCast(exchange_name.len));
+    try delete_payload.appendSlice(exchange_name);
+    // Flags: none (0x00)
+    try delete_payload.append(0x00);
+
+    // This should succeed and delete the exchange
+    try handler.handleExchangeDelete(&connection, 1, delete_payload.items);
+
+    // Verify exchange was deleted
+    const deleted_exchange = vhost.getExchange("test-exchange");
+    try std.testing.expect(deleted_exchange == null);
+}
+
+test "exchange method error handling" {
+    const allocator = std.testing.allocator;
+
+    var handler = ProtocolHandler.init(allocator);
+    defer handler.deinit();
+
+    const mock_socket = std.net.Stream{ .handle = 0 };
+    var connection = try Connection.init(allocator, 1, mock_socket);
+    defer connection.deinit();
+
+    connection.setState(.open);
+
+    // Test with no virtual host
+    const empty_payload = [_]u8{};
+    const result_no_vhost = handler.handleExchangeDeclare(&connection, 1, &empty_payload);
+    try std.testing.expectError(error.NoVirtualHost, result_no_vhost);
+
+    // Test with non-existent channel
+    try connection.setVirtualHost("test-vhost");
+    const result_no_channel = handler.handleExchangeDeclare(&connection, 99, &empty_payload);
+    try std.testing.expectError(error.ChannelNotFound, result_no_channel);
+
+    // Test with invalid payload
+    try connection.addChannel(1);
+    const result_invalid = handler.handleExchangeDeclare(&connection, 1, &empty_payload);
+    try std.testing.expectError(error.InvalidExchangeDeclare, result_invalid);
 }
