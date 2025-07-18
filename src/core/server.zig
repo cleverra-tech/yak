@@ -63,7 +63,7 @@ pub const Server = struct {
 
         // Set up persistence callback in protocol handler
         server.protocol_handler.persist_message_fn = serverPersistMessage;
-        
+
         // Set up error handler callback in protocol handler
         server.protocol_handler.error_handler_fn = serverHandleError;
 
@@ -74,7 +74,7 @@ pub const Server = struct {
         server.recoverPersistentState() catch |err| {
             const error_info = ErrorHelpers.recoverableError(.resource_error, "Failed to recover persistent state from storage");
             const action = server.error_handler.handleError(error_info);
-            
+
             if (action == .shutdown_server) {
                 return err;
             }
@@ -130,7 +130,7 @@ pub const Server = struct {
             const client_socket = self.tcp_server.?.accept() catch {
                 const error_info = ErrorHelpers.recoverableError(.resource_error, "Failed to accept incoming connection");
                 const action = self.error_handler.handleError(error_info);
-                
+
                 switch (action) {
                     .shutdown_server => {
                         std.log.err("Shutting down server due to connection accept failures");
@@ -168,7 +168,7 @@ pub const Server = struct {
                 else => {
                     const error_info = ErrorHelpers.recoverableError(.resource_error, "Failed to accept connection with timeout");
                     const action = self.error_handler.handleError(error_info);
-                    
+
                     switch (action) {
                         .shutdown_server => {
                             std.log.err("Shutting down server due to persistent connection failures", .{});
@@ -245,7 +245,7 @@ pub const Server = struct {
         self.handleConnection(client_socket) catch {
             const error_info = ErrorHelpers.connectionError(.connection_forced, "Failed to initialize connection", 0);
             const action = self.error_handler.handleError(error_info);
-            
+
             switch (action) {
                 .shutdown_server => {
                     std.log.err("Shutting down server due to critical connection handling failure", .{});
@@ -263,7 +263,7 @@ pub const Server = struct {
         const connection = self.allocator.create(NetworkConnection) catch |err| {
             const error_info = ErrorHelpers.fatalError(.resource_error, "Failed to allocate memory for connection");
             const action = self.error_handler.handleError(error_info);
-            
+
             if (action == .shutdown_server) {
                 self.requestShutdown();
                 return error.OutOfMemory;
@@ -273,10 +273,10 @@ pub const Server = struct {
 
         connection.* = NetworkConnection.init(self.allocator, self.next_connection_id, client_socket.stream) catch |err| {
             self.allocator.destroy(connection);
-            
+
             const error_info = ErrorHelpers.connectionError(.connection_forced, "Failed to initialize connection", self.next_connection_id);
             _ = self.error_handler.handleError(error_info);
-            
+
             return err;
         };
 
@@ -286,10 +286,10 @@ pub const Server = struct {
         self.connections.append(connection) catch |err| {
             connection.deinit();
             self.allocator.destroy(connection);
-            
+
             const error_info = ErrorHelpers.fatalError(.resource_error, "Failed to track connection");
             const action = self.error_handler.handleError(error_info);
-            
+
             if (action == .shutdown_server) {
                 self.requestShutdown();
             }
@@ -302,12 +302,12 @@ pub const Server = struct {
         self.protocol_handler.handleConnection(connection) catch |err| {
             const error_info = ErrorHelpers.connectionError(.connection_forced, "Protocol handling failed", connection_id);
             const action = self.error_handler.handleError(error_info);
-            
+
             switch (action) {
                 .shutdown_server => self.requestShutdown(),
                 else => {}, // Connection will be cleaned up by removeConnection
             }
-            
+
             self.removeConnection(connection);
             return err;
         };
@@ -346,7 +346,7 @@ pub const Server = struct {
         return @intCast(self.vhosts.count());
     }
 
-    /// Request graceful shutdown 
+    /// Request graceful shutdown
     pub fn requestShutdown(self: *Server) void {
         self.shutdown_requested.store(true, .monotonic);
         std.log.info("Graceful shutdown requested", .{});
@@ -584,7 +584,7 @@ pub const Server = struct {
     pub fn performMaintenance(self: *Server) void {
         // Clear old errors (older than 1 hour)
         self.error_handler.clearOldErrors(3600);
-        
+
         std.log.debug("Performed server maintenance: cleared old errors", .{});
     }
 };

@@ -140,7 +140,7 @@ pub const ProtocolHandler = struct {
                 const error_info = ErrorHelpers.connectionError(.connection_forced, "Frame receive error", connection.id);
                 if (self.error_handler_fn) |handler_fn| {
                     const action = handler_fn(error_info);
-                    
+
                     switch (action) {
                         .close_connection, .shutdown_server => break,
                         else => {
@@ -161,7 +161,7 @@ pub const ProtocolHandler = struct {
                     const error_info = ErrorHelpers.connectionError(.unexpected_frame, "Frame handling error", connection.id);
                     if (self.error_handler_fn) |handler_fn| {
                         const action = handler_fn(error_info);
-                        
+
                         switch (action) {
                             .close_connection, .shutdown_server => break,
                             .close_channel => {

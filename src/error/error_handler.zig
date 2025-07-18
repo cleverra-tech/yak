@@ -9,12 +9,12 @@ pub const AMQPErrorCode = enum(u16) {
     not_found = 404,
     resource_locked = 405,
     precondition_failed = 406,
-    
-    // Channel errors  
+
+    // Channel errors
     content_too_large = 311,
     no_route = 312,
     no_consumers = 313,
-    
+
     // General errors
     syntax_error = 502,
     command_invalid = 503,
@@ -28,13 +28,13 @@ pub const AMQPErrorCode = enum(u16) {
     pub fn toString(self: AMQPErrorCode) []const u8 {
         return switch (self) {
             .connection_forced => "CONNECTION_FORCED",
-            .invalid_path => "INVALID_PATH", 
+            .invalid_path => "INVALID_PATH",
             .access_refused => "ACCESS_REFUSED",
             .not_found => "NOT_FOUND",
             .resource_locked => "RESOURCE_LOCKED",
             .precondition_failed => "PRECONDITION_FAILED",
             .content_too_large => "CONTENT_TOO_LARGE",
-            .no_route => "NO_ROUTE", 
+            .no_route => "NO_ROUTE",
             .no_consumers => "NO_CONSUMERS",
             .syntax_error => "SYNTAX_ERROR",
             .command_invalid => "COMMAND_INVALID",
@@ -50,14 +50,14 @@ pub const AMQPErrorCode = enum(u16) {
 
 /// Error severity levels for recovery decisions
 pub const ErrorSeverity = enum {
-    recoverable,    // Can continue operation
-    connection,     // Must close connection but server continues  
-    fatal,          // Must shutdown server
+    recoverable, // Can continue operation
+    connection, // Must close connection but server continues
+    fatal, // Must shutdown server
 
     pub fn toString(self: ErrorSeverity) []const u8 {
         return switch (self) {
             .recoverable => "RECOVERABLE",
-            .connection => "CONNECTION", 
+            .connection => "CONNECTION",
             .fatal => "FATAL",
         };
     }
@@ -117,10 +117,10 @@ pub const RecoveryAction = enum {
 
     pub fn toString(self: RecoveryAction) []const u8 {
         return switch (self) {
-            .continue_operation => "CONTINUE", 
+            .continue_operation => "CONTINUE",
             .close_channel => "CLOSE_CHANNEL",
             .close_connection => "CLOSE_CONNECTION",
-            .restart_connection => "RESTART_CONNECTION", 
+            .restart_connection => "RESTART_CONNECTION",
             .shutdown_server => "SHUTDOWN_SERVER",
         };
     }
@@ -158,7 +158,7 @@ pub const ErrorHandler = struct {
     pub fn handleError(self: *ErrorHandler, error_info: ErrorInfo) RecoveryAction {
         // Log the error
         self.logError(error_info);
-        
+
         // Increment counters
         _ = self.error_count.fetchAdd(1, .monotonic);
         if (error_info.severity == .fatal) {
@@ -172,24 +172,23 @@ pub const ErrorHandler = struct {
     fn logError(self: *ErrorHandler, error_info: ErrorInfo) void {
         // Log to console immediately
         self.logToConsole(error_info);
-        
+
         // Store in error log for later analysis (thread-safe)
         self.error_mutex.lock();
         defer self.error_mutex.unlock();
-        
+
         // Prevent unbounded growth of error log
         if (self.error_log.items.len >= 1000) {
             var oldest = self.error_log.orderedRemove(0);
             oldest.deinit(self.allocator);
         }
-        
+
         self.error_log.append(error_info) catch |err| {
             std.log.err("Failed to store error in log: {}", .{err});
         };
     }
 
     fn logToConsole(self: *ErrorHandler, error_info: ErrorInfo) void {
-        
         const connection_info = if (error_info.connection_id) |conn_id|
             std.fmt.allocPrint(self.allocator, " connection={}", .{conn_id}) catch ""
         else
@@ -209,24 +208,15 @@ pub const ErrorHandler = struct {
         defer if (context_info.len > 0) self.allocator.free(context_info);
 
         switch (error_info.severity) {
-            .recoverable => std.log.warn("[{}] {s}: {s}{s}{s}{s}", .{
-                @intFromEnum(error_info.code), error_info.code.toString(), error_info.message,
-                connection_info, channel_info, context_info
-            }),
-            .connection => std.log.err("[{}] {s}: {s}{s}{s}{s}", .{
-                @intFromEnum(error_info.code), error_info.code.toString(), error_info.message,
-                connection_info, channel_info, context_info
-            }),
-            .fatal => std.log.err("[FATAL][{}] {s}: {s}{s}{s}{s}", .{
-                @intFromEnum(error_info.code), error_info.code.toString(), error_info.message,
-                connection_info, channel_info, context_info
-            }),
+            .recoverable => std.log.warn("[{}] {s}: {s}{s}{s}{s}", .{ @intFromEnum(error_info.code), error_info.code.toString(), error_info.message, connection_info, channel_info, context_info }),
+            .connection => std.log.err("[{}] {s}: {s}{s}{s}{s}", .{ @intFromEnum(error_info.code), error_info.code.toString(), error_info.message, connection_info, channel_info, context_info }),
+            .fatal => std.log.err("[FATAL][{}] {s}: {s}{s}{s}{s}", .{ @intFromEnum(error_info.code), error_info.code.toString(), error_info.message, connection_info, channel_info, context_info }),
         }
     }
 
     fn determineRecoveryAction(self: *ErrorHandler, error_info: ErrorInfo) RecoveryAction {
         _ = self;
-        
+
         // Base decision on error severity and code
         return switch (error_info.severity) {
             .recoverable => switch (error_info.code) {
@@ -250,15 +240,15 @@ pub const ErrorHandler = struct {
     /// Get error statistics for monitoring
     pub fn getErrorStats(self: *const ErrorHandler, allocator: std.mem.Allocator) !std.json.Value {
         var stats = std.json.ObjectMap.init(allocator);
-        
+
         try stats.put("total_errors", std.json.Value{ .integer = @intCast(self.error_count.load(.monotonic)) });
         try stats.put("fatal_errors", std.json.Value{ .integer = @intCast(self.fatal_error_count.load(.monotonic)) });
-        
+
         self.error_mutex.lock();
         defer self.error_mutex.unlock();
-        
+
         try stats.put("recent_errors", std.json.Value{ .integer = @intCast(self.error_log.items.len) });
-        
+
         return std.json.Value{ .object = stats };
     }
 
@@ -266,10 +256,10 @@ pub const ErrorHandler = struct {
     pub fn clearOldErrors(self: *ErrorHandler, max_age_seconds: i64) void {
         self.error_mutex.lock();
         defer self.error_mutex.unlock();
-        
+
         const cutoff_time = std.time.timestamp() - max_age_seconds;
         var i: usize = 0;
-        
+
         while (i < self.error_log.items.len) {
             if (self.error_log.items[i].timestamp < cutoff_time) {
                 var removed = self.error_log.orderedRemove(i);
@@ -288,7 +278,7 @@ pub const ErrorHelpers = struct {
         return ErrorInfo.init(code, .connection, message).withConnection(connection_id);
     }
 
-    /// Create error for channel-level issues  
+    /// Create error for channel-level issues
     pub fn channelError(code: AMQPErrorCode, message: []const u8, connection_id: u64, channel_id: u16) ErrorInfo {
         return ErrorInfo.init(code, .recoverable, message)
             .withConnection(connection_id)
