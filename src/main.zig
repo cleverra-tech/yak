@@ -4,6 +4,13 @@ const wombat = @import("wombat");
 const Server = @import("core/server.zig").Server;
 const Config = @import("config.zig").Config;
 
+// Export modules for benchmarks and tests
+pub const message = @import("message.zig");
+pub const queue = @import("routing/queue.zig");
+pub const exchange = @import("routing/exchange.zig");
+pub const vhost = @import("core/vhost.zig");
+pub const consumer = @import("consumer/consumer.zig");
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

@@ -78,6 +78,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Add src as a module for benchmarks to import
+    const yak_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    yak_module.addImport("wombat", wombat_module);
+    benchmark_exe.root_module.addImport("yak", yak_module);
     benchmark_exe.root_module.addImport("wombat", wombat_module);
     b.installArtifact(benchmark_exe);
 

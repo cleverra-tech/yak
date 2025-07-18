@@ -557,7 +557,9 @@ pub const Queue = struct {
                 // Dead letter the oldest message if configured
                 if (self.dead_letter_exchange != null) {
                     var oldest_message = self.messages.orderedRemove(0);
-                    try oldest_message.addDeathEvent(self.name, .maxlen, oldest_message.exchange, &[_][]const u8{oldest_message.routing_key});
+                    const routing_keys = [_][]const u8{oldest_message.routing_key};
+                    const routing_keys_slice: [][]const u8 = @constCast(&routing_keys);
+                    try oldest_message.addDeathEvent(self.name, .maxlen, oldest_message.exchange, routing_keys_slice);
 
                     if (dead_letter_fn) |dl_fn| {
                         dl_fn(&oldest_message);

@@ -221,7 +221,7 @@ pub const Message = struct {
 
         // Copy death events
         for (self.deaths.items) |*death| {
-            var cloned_keys = try allocator.alloc([]u8, death.routing_keys.len);
+            var cloned_keys = try allocator.alloc([]const u8, death.routing_keys.len);
             for (death.routing_keys, 0..) |key, i| {
                 cloned_keys[i] = try allocator.dupe(u8, key);
             }
@@ -259,7 +259,7 @@ pub const Message = struct {
         }
 
         // Create new death event
-        var cloned_keys = try self.allocator.alloc([]u8, routing_keys.len);
+        var cloned_keys = try self.allocator.alloc([]const u8, routing_keys.len);
         for (routing_keys, 0..) |key, i| {
             cloned_keys[i] = try self.allocator.dupe(u8, key);
         }
