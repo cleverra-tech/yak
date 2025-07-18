@@ -368,7 +368,7 @@ pub const Server = struct {
 
             // Basic command handling
             if (std.mem.eql(u8, command, "help")) {
-                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  list queues [vhost] - List all queues in virtual host (default: /)\n  list exchanges [vhost] - List all exchanges in virtual host (default: /)\n  queue info <name> [vhost] - Show detailed information about a queue\n  queue declare <name> [--durable] [--exclusive] [--auto-delete] [vhost] - Create a new queue\n  queue delete <name> [--if-unused] [--if-empty] [vhost] - Delete a queue\n  queue purge <name> [vhost] - Remove all messages from a queue\n  exchange declare <name> <type> [--durable] [--auto-delete] [vhost] - Create a new exchange\n  exchange delete <name> [--if-unused] [vhost] - Delete an exchange\n  exit - Close connection\n";
+                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  list queues [vhost] - List all queues in virtual host (default: /)\n  list exchanges [vhost] - List all exchanges in virtual host (default: /)\n  list connections - List all active client connections\n  queue info <name> [vhost] - Show detailed information about a queue\n  queue declare <name> [--durable] [--exclusive] [--auto-delete] [vhost] - Create a new queue\n  queue delete <name> [--if-unused] [--if-empty] [vhost] - Delete a queue\n  queue purge <name> [vhost] - Remove all messages from a queue\n  exchange declare <name> <type> [--durable] [--auto-delete] [vhost] - Create a new exchange\n  exchange delete <name> [--if-unused] [vhost] - Delete an exchange\n  exit - Close connection\n";
                 try connection.stream.writeAll(help_msg);
             } else if (std.mem.startsWith(u8, command, "list queues")) {
                 try self.handleListQueuesCommand(connection, command);
@@ -386,6 +386,8 @@ pub const Server = struct {
                 try self.handleExchangeDeleteCommand(connection, command);
             } else if (std.mem.startsWith(u8, command, "list exchanges")) {
                 try self.handleListExchangesCommand(connection, command);
+            } else if (std.mem.startsWith(u8, command, "list connections")) {
+                try self.handleListConnectionsCommand(connection, command);
             } else if (std.mem.eql(u8, command, "status")) {
                 const status_msg = try std.fmt.allocPrint(self.allocator, "Server Status:\n  Running: {}\n  Connections: {}\n  Virtual Hosts: {}\n  Shutdown Requested: {}\n", .{
                     self.running,
@@ -966,6 +968,49 @@ pub const Server = struct {
         try connection.stream.writeAll(success_msg);
     }
 
+    fn handleListConnectionsCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        _ = command; // No additional parameters needed for listing connections
+
+        // Format and send connection list
+        if (self.connections.items.len == 0) {
+            const no_connections_msg = "No active client connections\n";
+            try connection.stream.writeAll(no_connections_msg);
+        } else {
+            const header_msg = try std.fmt.allocPrint(self.allocator, "Active client connections ({}):\n", .{self.connections.items.len});
+            defer self.allocator.free(header_msg);
+            try connection.stream.writeAll(header_msg);
+
+            for (self.connections.items) |conn| {
+                const vhost_name = conn.virtual_host orelse "none";
+                const state_name = @tagName(conn.state);
+                const channel_count = conn.channels.count();
+
+                const connection_info = try std.fmt.allocPrint(self.allocator,
+                    \\  Connection ID: {}
+                    \\    State: {s}
+                    \\    Virtual Host: {s}
+                    \\    Authenticated: {}
+                    \\    Channels: {}
+                    \\    Heartbeat Interval: {}s
+                    \\    Max Frame Size: {} bytes
+                    \\    Blocked: {}
+                    \\
+                , .{
+                    conn.id,
+                    state_name,
+                    vhost_name,
+                    conn.authenticated,
+                    channel_count,
+                    conn.heartbeat_interval,
+                    conn.max_frame_size,
+                    conn.blocked,
+                });
+                defer self.allocator.free(connection_info);
+                try connection.stream.writeAll(connection_info);
+            }
+        }
+    }
+
     fn handleConnectionWithRecovery(self: *Server, client_socket: std.net.Server.Connection) void {
         self.handleConnection(client_socket) catch {
             const error_info = ErrorHelpers.connectionError(.connection_forced, "Failed to initialize connection", 0);
@@ -1508,4 +1553,20 @@ test "server exchange commands handling" {
     try vhost.deleteExchange("test-fanout", false);
     try std.testing.expectEqual(initial_count, vhost.getExchangeCount());
     try std.testing.expect(vhost.getExchange("test-fanout") == null);
+}
+
+test "server connection listing functionality" {
+    const allocator = std.testing.allocator;
+
+    var config = try Config.default(allocator);
+    defer config.deinit(allocator);
+
+    var server = try Server.init(allocator, config);
+    defer server.deinit();
+
+    // Initially no connections
+    try std.testing.expectEqual(@as(u32, 0), server.getConnectionCount());
+
+    // The connections list should be empty
+    try std.testing.expectEqual(@as(usize, 0), server.connections.items.len);
 }
