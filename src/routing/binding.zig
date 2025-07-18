@@ -76,7 +76,7 @@ pub const Binding = struct {
             self.argumentsMatch(other.arguments);
     }
 
-    fn argumentsMatch(self: *const Binding, other_args: ?[]const u8) bool {
+    pub fn argumentsMatch(self: *const Binding, other_args: ?[]const u8) bool {
         if (self.arguments == null and other_args == null) return true;
         if (self.arguments == null or other_args == null) return false;
         return std.mem.eql(u8, self.arguments.?, other_args.?);

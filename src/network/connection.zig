@@ -196,19 +196,17 @@ pub const Connection = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Encode frame to write buffer
-        try frame.encode(&self.write_buffer);
+        // Encode frame
+        const encoded_frame = try frame.encode(self.allocator);
+        defer self.allocator.free(encoded_frame);
 
         // Send data
-        const bytes_written = try self.socket.write(self.write_buffer.items);
-        if (bytes_written != self.write_buffer.items.len) {
+        const bytes_written = try self.socket.write(encoded_frame);
+        if (bytes_written != encoded_frame.len) {
             return error.PartialWrite;
         }
 
-        // Clear write buffer for next frame
-        self.write_buffer.clearRetainingCapacity();
-
-        std.log.debug("Frame sent on connection {}: type={}, channel={}, size={}", .{ self.id, frame.frame_type, frame.channel, bytes_written });
+        std.log.debug("Frame sent on connection {}: type={}, channel={}, size={}", .{ self.id, frame.frame_type, frame.channel_id, bytes_written });
     }
 
     pub fn receiveFrame(self: *Connection) !?Frame {
@@ -256,7 +254,7 @@ pub const Connection = struct {
         // Create and return frame
         const frame = Frame{
             .frame_type = frame_type,
-            .channel = channel,
+            .channel_id = channel,
             .payload = try self.allocator.dupe(u8, payload),
         };
 
@@ -268,7 +266,7 @@ pub const Connection = struct {
     pub fn sendHeartbeat(self: *Connection) !void {
         const heartbeat_frame = Frame{
             .frame_type = .heartbeat,
-            .channel = 0,
+            .channel_id = 0,
             .payload = &[_]u8{},
         };
 

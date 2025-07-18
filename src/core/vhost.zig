@@ -235,7 +235,7 @@ pub const VirtualHost = struct {
     }
 
     fn generateQueueName(self: *VirtualHost) ![]const u8 {
-        var random = std.rand.DefaultPrng.init(@intCast(std.time.timestamp()));
+        var random = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
         const rand_int = random.random().int(u32);
         return try std.fmt.allocPrint(self.allocator, "amq.gen-{x}", .{rand_int});
     }

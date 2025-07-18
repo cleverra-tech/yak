@@ -137,7 +137,7 @@ pub const ProtocolHandler = struct {
 
         const frame = Frame{
             .frame_type = .method,
-            .channel = 0,
+            .channel_id = 0,
             .payload = try self.allocator.dupe(u8, payload.items),
         };
         defer self.allocator.free(frame.payload);
@@ -163,14 +163,14 @@ pub const ProtocolHandler = struct {
         const class_id = std.mem.readInt(u16, frame.payload[0..2], .big);
         const method_id = std.mem.readInt(u16, frame.payload[2..4], .big);
 
-        std.log.debug("Method frame: connection={}, channel={}, class={}, method={}", .{ connection.id, frame.channel, class_id, method_id });
+        std.log.debug("Method frame: connection={}, channel={}, class={}, method={}", .{ connection.id, frame.channel_id, class_id, method_id });
 
         switch (class_id) {
             10 => try self.handleConnectionMethod(connection, method_id, frame.payload[4..]),
-            20 => try self.handleChannelMethod(connection, frame.channel, method_id, frame.payload[4..]),
-            40 => try self.handleExchangeMethod(connection, frame.channel, method_id, frame.payload[4..]),
-            50 => try self.handleQueueMethod(connection, frame.channel, method_id, frame.payload[4..]),
-            60 => try self.handleBasicMethod(connection, frame.channel, method_id, frame.payload[4..]),
+            20 => try self.handleChannelMethod(connection, frame.channel_id, method_id, frame.payload[4..]),
+            40 => try self.handleExchangeMethod(connection, frame.channel_id, method_id, frame.payload[4..]),
+            50 => try self.handleQueueMethod(connection, frame.channel_id, method_id, frame.payload[4..]),
+            60 => try self.handleBasicMethod(connection, frame.channel_id, method_id, frame.payload[4..]),
             else => {
                 std.log.warn("Unknown method class {} on connection {}", .{ class_id, connection.id });
                 return error.UnknownMethodClass;
@@ -221,7 +221,7 @@ pub const ProtocolHandler = struct {
 
         const frame = Frame{
             .frame_type = .method,
-            .channel = 0,
+            .channel_id = 0,
             .payload = try self.allocator.dupe(u8, payload.items),
         };
         defer self.allocator.free(frame.payload);
@@ -289,7 +289,7 @@ pub const ProtocolHandler = struct {
 
         const frame = Frame{
             .frame_type = .method,
-            .channel = 0,
+            .channel_id = 0,
             .payload = try self.allocator.dupe(u8, payload.items),
         };
         defer self.allocator.free(frame.payload);
@@ -321,7 +321,7 @@ pub const ProtocolHandler = struct {
 
         const frame = Frame{
             .frame_type = .method,
-            .channel = 0,
+            .channel_id = 0,
             .payload = try self.allocator.dupe(u8, payload.items),
         };
         defer self.allocator.free(frame.payload);
@@ -374,7 +374,7 @@ pub const ProtocolHandler = struct {
 
         const frame = Frame{
             .frame_type = .method,
-            .channel = channel_id,
+            .channel_id = channel_id,
             .payload = try self.allocator.dupe(u8, payload.items),
         };
         defer self.allocator.free(frame.payload);
@@ -419,7 +419,7 @@ pub const ProtocolHandler = struct {
 
         const frame = Frame{
             .frame_type = .method,
-            .channel = channel_id,
+            .channel_id = channel_id,
             .payload = try self.allocator.dupe(u8, payload.items),
         };
         defer self.allocator.free(frame.payload);
@@ -460,7 +460,7 @@ pub const ProtocolHandler = struct {
 
         const frame = Frame{
             .frame_type = .method,
-            .channel = channel_id,
+            .channel_id = channel_id,
             .payload = try self.allocator.dupe(u8, payload.items),
         };
         defer self.allocator.free(frame.payload);
@@ -499,7 +499,8 @@ pub const ProtocolHandler = struct {
             return error.InvalidExchangeDeclare;
         }
 
-        var reader = std.io.fixedBufferStream(payload).reader();
+        var stream = std.io.fixedBufferStream(payload);
+        const reader = stream.reader();
 
         // Skip reserved field
         _ = try reader.readInt(u16, .big);
@@ -542,7 +543,7 @@ pub const ProtocolHandler = struct {
         const args_len = try reader.readInt(u32, .big);
         var arguments: ?[]const u8 = null;
         if (args_len > 0) {
-            var args_buf = try self.allocator.alloc(u8, args_len);
+            const args_buf = try self.allocator.alloc(u8, args_len);
             try reader.readNoEof(args_buf);
             arguments = args_buf;
         }
@@ -597,7 +598,7 @@ pub const ProtocolHandler = struct {
 
         const frame = Frame{
             .frame_type = .method,
-            .channel = channel_id,
+            .channel_id = channel_id,
             .payload = try self.allocator.dupe(u8, payload.items),
         };
         defer self.allocator.free(frame.payload);
@@ -611,7 +612,8 @@ pub const ProtocolHandler = struct {
             return error.InvalidExchangeDelete;
         }
 
-        var reader = std.io.fixedBufferStream(payload).reader();
+        var stream = std.io.fixedBufferStream(payload);
+        const reader = stream.reader();
 
         // Skip reserved field
         _ = try reader.readInt(u16, .big);
@@ -670,7 +672,7 @@ pub const ProtocolHandler = struct {
 
         const frame = Frame{
             .frame_type = .method,
-            .channel = channel_id,
+            .channel_id = channel_id,
             .payload = try self.allocator.dupe(u8, payload.items),
         };
         defer self.allocator.free(frame.payload);
@@ -687,7 +689,7 @@ pub const ProtocolHandler = struct {
 
         // TODO: Exchange-to-exchange binding is not widely used in AMQP 0-9-1
         // For now, return an error indicating this is not supported
-        std.log.debug("Exchange.Bind not implemented: exchange-to-exchange binding not supported");
+        std.log.debug("Exchange.Bind not implemented: exchange-to-exchange binding not supported", .{});
         return error.ExchangeBindNotSupported;
     }
 
@@ -699,7 +701,7 @@ pub const ProtocolHandler = struct {
 
         // TODO: Exchange-to-exchange unbinding is not widely used in AMQP 0-9-1
         // For now, return an error indicating this is not supported
-        std.log.debug("Exchange.Unbind not implemented: exchange-to-exchange unbinding not supported");
+        std.log.debug("Exchange.Unbind not implemented: exchange-to-exchange unbinding not supported", .{});
         return error.ExchangeUnbindNotSupported;
     }
 
@@ -722,7 +724,8 @@ pub const ProtocolHandler = struct {
             return error.InvalidQueueDeclare;
         }
 
-        var reader = std.io.fixedBufferStream(payload).reader();
+        var stream = std.io.fixedBufferStream(payload);
+        const reader = stream.reader();
 
         // Skip reserved field
         _ = try reader.readInt(u16, .big);
@@ -746,7 +749,7 @@ pub const ProtocolHandler = struct {
         const args_len = try reader.readInt(u32, .big);
         var arguments: ?[]const u8 = null;
         if (args_len > 0) {
-            var args_buf = try self.allocator.alloc(u8, args_len);
+            const args_buf = try self.allocator.alloc(u8, args_len);
             try reader.readNoEof(args_buf);
             arguments = args_buf;
         }
@@ -813,7 +816,7 @@ pub const ProtocolHandler = struct {
 
         const frame = Frame{
             .frame_type = .method,
-            .channel = channel_id,
+            .channel_id = channel_id,
             .payload = try self.allocator.dupe(u8, payload.items),
         };
         defer self.allocator.free(frame.payload);
@@ -827,7 +830,8 @@ pub const ProtocolHandler = struct {
             return error.InvalidQueueBind;
         }
 
-        var reader = std.io.fixedBufferStream(payload).reader();
+        var stream = std.io.fixedBufferStream(payload);
+        const reader = stream.reader();
 
         // Skip reserved field
         _ = try reader.readInt(u16, .big);
@@ -861,7 +865,7 @@ pub const ProtocolHandler = struct {
         const args_len = try reader.readInt(u32, .big);
         var arguments: ?[]const u8 = null;
         if (args_len > 0) {
-            var args_buf = try self.allocator.alloc(u8, args_len);
+            const args_buf = try self.allocator.alloc(u8, args_len);
             try reader.readNoEof(args_buf);
             arguments = args_buf;
         }
@@ -909,7 +913,7 @@ pub const ProtocolHandler = struct {
 
         const frame = Frame{
             .frame_type = .method,
-            .channel = channel_id,
+            .channel_id = channel_id,
             .payload = try self.allocator.dupe(u8, payload.items),
         };
         defer self.allocator.free(frame.payload);
@@ -923,7 +927,8 @@ pub const ProtocolHandler = struct {
             return error.InvalidQueueUnbind;
         }
 
-        var reader = std.io.fixedBufferStream(payload).reader();
+        var stream = std.io.fixedBufferStream(payload);
+        const reader = stream.reader();
 
         // Skip reserved field
         _ = try reader.readInt(u16, .big);
@@ -953,7 +958,7 @@ pub const ProtocolHandler = struct {
         const args_len = try reader.readInt(u32, .big);
         var arguments: ?[]const u8 = null;
         if (args_len > 0) {
-            var args_buf = try self.allocator.alloc(u8, args_len);
+            const args_buf = try self.allocator.alloc(u8, args_len);
             try reader.readNoEof(args_buf);
             arguments = args_buf;
         }
@@ -999,7 +1004,7 @@ pub const ProtocolHandler = struct {
 
         const frame = Frame{
             .frame_type = .method,
-            .channel = channel_id,
+            .channel_id = channel_id,
             .payload = try self.allocator.dupe(u8, payload.items),
         };
         defer self.allocator.free(frame.payload);
@@ -1013,7 +1018,8 @@ pub const ProtocolHandler = struct {
             return error.InvalidQueuePurge;
         }
 
-        var reader = std.io.fixedBufferStream(payload).reader();
+        var stream = std.io.fixedBufferStream(payload);
+        const reader = stream.reader();
 
         // Skip reserved field
         _ = try reader.readInt(u16, .big);
@@ -1073,7 +1079,7 @@ pub const ProtocolHandler = struct {
 
         const frame = Frame{
             .frame_type = .method,
-            .channel = channel_id,
+            .channel_id = channel_id,
             .payload = try self.allocator.dupe(u8, payload.items),
         };
         defer self.allocator.free(frame.payload);
@@ -1087,7 +1093,8 @@ pub const ProtocolHandler = struct {
             return error.InvalidQueueDelete;
         }
 
-        var reader = std.io.fixedBufferStream(payload).reader();
+        var stream = std.io.fixedBufferStream(payload);
+        const reader = stream.reader();
 
         // Skip reserved field
         _ = try reader.readInt(u16, .big);
@@ -1151,7 +1158,7 @@ pub const ProtocolHandler = struct {
 
         const frame = Frame{
             .frame_type = .method,
-            .channel = channel_id,
+            .channel_id = channel_id,
             .payload = try self.allocator.dupe(u8, payload.items),
         };
         defer self.allocator.free(frame.payload);
@@ -1173,14 +1180,14 @@ pub const ProtocolHandler = struct {
         _ = self;
 
         // TODO: Implement content header handling
-        std.log.debug("Header frame not yet implemented: connection={}, channel={}", .{ connection.id, frame.channel });
+        std.log.debug("Header frame not yet implemented: connection={}, channel={}", .{ connection.id, frame.channel_id });
     }
 
     fn handleBodyFrame(self: *ProtocolHandler, connection: *Connection, frame: Frame) !void {
         _ = self;
 
         // TODO: Implement content body handling
-        std.log.debug("Body frame not yet implemented: connection={}, channel={}", .{ connection.id, frame.channel });
+        std.log.debug("Body frame not yet implemented: connection={}, channel={}", .{ connection.id, frame.channel_id });
     }
 
     fn handleHeartbeatFrame(self: *ProtocolHandler, connection: *Connection, frame: Frame) !void {
