@@ -26,6 +26,9 @@ pub const Exchange = struct {
     arguments: ?[]const u8,
     allocator: std.mem.Allocator,
 
+    // Performance optimizations
+    direct_routing_map: std.HashMap([]const u8, std.ArrayList([]const u8), std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
+
     // Statistics
     messages_in: u64,
     messages_out: u64,
@@ -50,6 +53,7 @@ pub const Exchange = struct {
             .bindings = std.ArrayList(Binding).init(allocator),
             .arguments = if (arguments) |args| try allocator.dupe(u8, args) else null,
             .allocator = allocator,
+            .direct_routing_map = std.HashMap([]const u8, std.ArrayList([]const u8), std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .messages_in = 0,
             .messages_out = 0,
             .bytes_in = 0,
@@ -62,6 +66,14 @@ pub const Exchange = struct {
             binding.deinit();
         }
         self.bindings.deinit();
+
+        // Clean up direct routing map
+        var routing_iter = self.direct_routing_map.iterator();
+        while (routing_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
+        }
+        self.direct_routing_map.deinit();
 
         if (self.arguments) |args| {
             self.allocator.free(args);
@@ -92,6 +104,12 @@ pub const Exchange = struct {
         );
 
         try self.bindings.append(binding);
+
+        // Update direct routing map for performance
+        if (self.exchange_type == .direct) {
+            try self.updateDirectRoutingMap(routing_key, queue_name, true);
+        }
+
         std.log.debug("Binding added: {s} -> {s} (key: {s})", .{ self.name, queue_name, routing_key });
     }
 
@@ -107,6 +125,12 @@ pub const Exchange = struct {
                 binding.argumentsMatch(arguments))
             {
                 var removed_binding = self.bindings.swapRemove(i);
+
+                // Update direct routing map for performance
+                if (self.exchange_type == .direct) {
+                    try self.updateDirectRoutingMap(routing_key, queue_name, false);
+                }
+
                 removed_binding.deinit();
                 std.log.debug("Binding removed: {s} -/-> {s} (key: {s})", .{ self.name, queue_name, routing_key });
                 return;
@@ -148,9 +172,10 @@ pub const Exchange = struct {
     }
 
     fn routeDirect(self: *Exchange, message: *const Message, matched_queues: *std.ArrayList([]const u8)) !void {
-        for (self.bindings.items) |binding| {
-            if (std.mem.eql(u8, binding.routing_key, message.routing_key)) {
-                try matched_queues.append(binding.queue_name);
+        // Use optimized hash map lookup for direct routing
+        if (self.direct_routing_map.get(message.routing_key)) |queue_list| {
+            for (queue_list.items) |queue_name| {
+                try matched_queues.append(queue_name);
             }
         }
     }
@@ -269,6 +294,37 @@ pub const Exchange = struct {
         return matched_count > 0;
     }
 
+    fn updateDirectRoutingMap(self: *Exchange, routing_key: []const u8, queue_name: []const u8, add: bool) !void {
+        const gop = try self.direct_routing_map.getOrPut(routing_key);
+
+        if (!gop.found_existing) {
+            // Create new entry
+            gop.key_ptr.* = try self.allocator.dupe(u8, routing_key);
+            gop.value_ptr.* = std.ArrayList([]const u8).init(self.allocator);
+        }
+
+        if (add) {
+            // Add queue to the list
+            try gop.value_ptr.append(queue_name);
+        } else {
+            // Remove queue from the list
+            const queue_list = gop.value_ptr;
+            for (queue_list.items, 0..) |name, i| {
+                if (std.mem.eql(u8, name, queue_name)) {
+                    _ = queue_list.swapRemove(i);
+                    break;
+                }
+            }
+
+            // If list is empty, remove the entire entry
+            if (queue_list.items.len == 0) {
+                self.allocator.free(gop.key_ptr.*);
+                queue_list.deinit();
+                _ = self.direct_routing_map.remove(routing_key);
+            }
+        }
+    }
+
     pub fn getBindingCount(self: *const Exchange) u32 {
         return @intCast(self.bindings.items.len);
     }
@@ -293,26 +349,30 @@ pub const Exchange = struct {
 
 // Topic pattern matching using std.mem operations (no regex dependency)
 fn matchTopicWildcards(pattern: []const u8, routing_key: []const u8) bool {
-    var pattern_parts = std.mem.splitScalar(u8, pattern, '.');
-    var key_parts = std.mem.splitScalar(u8, routing_key, '.');
+    // Use stack-allocated arrays for better performance
+    var pattern_parts: [32][]const u8 = undefined;
+    var key_parts: [32][]const u8 = undefined;
 
-    var pattern_list = std.ArrayList([]const u8).init(std.heap.page_allocator);
-    defer pattern_list.deinit();
+    var pattern_count: usize = 0;
+    var key_count: usize = 0;
 
-    var key_list = std.ArrayList([]const u8).init(std.heap.page_allocator);
-    defer key_list.deinit();
-
-    // Collect pattern parts
-    while (pattern_parts.next()) |part| {
-        pattern_list.append(part) catch return false;
+    // Split pattern into parts
+    var pattern_iter = std.mem.splitScalar(u8, pattern, '.');
+    while (pattern_iter.next()) |part| {
+        if (pattern_count >= pattern_parts.len) return false; // Too many parts
+        pattern_parts[pattern_count] = part;
+        pattern_count += 1;
     }
 
-    // Collect key parts
-    while (key_parts.next()) |part| {
-        key_list.append(part) catch return false;
+    // Split key into parts
+    var key_iter = std.mem.splitScalar(u8, routing_key, '.');
+    while (key_iter.next()) |part| {
+        if (key_count >= key_parts.len) return false; // Too many parts
+        key_parts[key_count] = part;
+        key_count += 1;
     }
 
-    return matchTopicParts(pattern_list.items, key_list.items);
+    return matchTopicParts(pattern_parts[0..pattern_count], key_parts[0..key_count]);
 }
 
 fn matchTopicParts(pattern_parts: [][]const u8, key_parts: [][]const u8) bool {

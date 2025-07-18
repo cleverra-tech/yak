@@ -307,11 +307,17 @@ pub const Queue = struct {
     }
 
     fn tryDeliverMessages(self: *Queue) void {
-        // Round-robin delivery to consumers
+        // Optimized round-robin delivery to consumers
+        if (self.consumers.items.len == 0 or self.messages.items.len == 0) {
+            return;
+        }
+
+        var delivered_count: usize = 0;
         var consumer_index: usize = 0;
         var message_index: usize = 0;
+        const max_delivery_attempts = self.messages.items.len;
 
-        while (message_index < self.messages.items.len and self.consumers.items.len > 0) {
+        while (message_index < self.messages.items.len and delivered_count < max_delivery_attempts) {
             const consumer = &self.consumers.items[consumer_index % self.consumers.items.len];
 
             // Check if consumer can accept more messages (QoS limits)
@@ -331,12 +337,19 @@ pub const Queue = struct {
                     self.memory_usage -= message.body.len;
                 }
 
+                delivered_count += 1;
                 std.log.debug("Message delivered to consumer {s} from queue {s}", .{ consumer.tag, self.name });
             } else {
                 message_index += 1;
             }
 
+            // Move to next consumer for round-robin
             consumer_index += 1;
+
+            // If all consumers are at QoS limit, break early
+            if (consumer_index >= self.consumers.items.len and message_index == 0) {
+                break;
+            }
         }
     }
 
