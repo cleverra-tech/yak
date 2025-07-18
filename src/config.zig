@@ -2,10 +2,12 @@ const std = @import("std");
 
 pub const Config = struct {
     tcp: TcpConfig,
+    ssl: SslConfig,
     storage: WombatStorageConfig,
     limits: LimitsConfig,
     auth: AuthConfig,
     cli: CliConfig,
+    metrics: MetricsConfig,
 
     const TcpConfig = struct {
         host: []const u8,
@@ -13,6 +15,43 @@ pub const Config = struct {
         max_connections: u32,
         read_buffer_size: u32,
         write_buffer_size: u32,
+    };
+
+    pub const SslConfig = struct {
+        enabled: bool,
+        port: u16,
+        cert_file: []const u8,
+        key_file: []const u8,
+        ca_file: ?[]const u8,
+        verify_client: bool,
+        cipher_suites: []const u8,
+        min_protocol_version: TlsVersion,
+        max_protocol_version: TlsVersion,
+
+        pub const TlsVersion = enum {
+            tls_1_0,
+            tls_1_1,
+            tls_1_2,
+            tls_1_3,
+
+            pub fn jsonStringify(self: TlsVersion, writer: anytype) !void {
+                try writer.write("\"");
+                try writer.write(@tagName(self));
+                try writer.write("\"");
+            }
+
+            pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !TlsVersion {
+                const str = try std.json.innerParse([]const u8, allocator, source, options);
+                defer allocator.free(str);
+
+                if (std.mem.eql(u8, str, "tls_1_0")) return .tls_1_0;
+                if (std.mem.eql(u8, str, "tls_1_1")) return .tls_1_1;
+                if (std.mem.eql(u8, str, "tls_1_2")) return .tls_1_2;
+                if (std.mem.eql(u8, str, "tls_1_3")) return .tls_1_3;
+
+                return error.UnknownField;
+            }
+        };
     };
 
     const WombatStorageConfig = struct {
@@ -83,6 +122,16 @@ pub const Config = struct {
         max_connections: u32,
     };
 
+    const MetricsConfig = struct {
+        enabled: bool,
+        host: []const u8,
+        port: u16,
+        collection_interval_ms: u64,
+        prometheus_enabled: bool,
+        json_enabled: bool,
+        health_check_enabled: bool,
+    };
+
     pub fn default(allocator: std.mem.Allocator) !Config {
         return Config{
             .tcp = TcpConfig{
@@ -91,6 +140,17 @@ pub const Config = struct {
                 .max_connections = 1000,
                 .read_buffer_size = 65536,
                 .write_buffer_size = 65536,
+            },
+            .ssl = SslConfig{
+                .enabled = false,
+                .port = 5671,
+                .cert_file = try allocator.dupe(u8, "cert.pem"),
+                .key_file = try allocator.dupe(u8, "key.pem"),
+                .ca_file = null,
+                .verify_client = false,
+                .cipher_suites = try allocator.dupe(u8, "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256"),
+                .min_protocol_version = .tls_1_2,
+                .max_protocol_version = .tls_1_3,
             },
             .storage = WombatStorageConfig{
                 .data_dir = try allocator.dupe(u8, "./data"),
@@ -133,6 +193,15 @@ pub const Config = struct {
                 .require_auth = false,
                 .max_connections = 10,
             },
+            .metrics = MetricsConfig{
+                .enabled = true,
+                .host = try allocator.dupe(u8, "127.0.0.1"),
+                .port = 8080,
+                .collection_interval_ms = 5000,
+                .prometheus_enabled = true,
+                .json_enabled = true,
+                .health_check_enabled = true,
+            },
         };
     }
 
@@ -170,11 +239,18 @@ pub const Config = struct {
 
     pub fn deinit(self: *const Config, allocator: std.mem.Allocator) void {
         allocator.free(self.tcp.host);
+        allocator.free(self.ssl.cert_file);
+        allocator.free(self.ssl.key_file);
+        if (self.ssl.ca_file) |ca_file| {
+            allocator.free(ca_file);
+        }
+        allocator.free(self.ssl.cipher_suites);
         allocator.free(self.storage.data_dir);
         allocator.free(self.storage.value_dir);
         allocator.free(self.auth.default_user);
         allocator.free(self.auth.default_password);
         allocator.free(self.cli.socket_path);
+        allocator.free(self.metrics.host);
     }
 
     fn cloneConfig(allocator: std.mem.Allocator, config: Config) !Config {
@@ -185,6 +261,17 @@ pub const Config = struct {
                 .max_connections = config.tcp.max_connections,
                 .read_buffer_size = config.tcp.read_buffer_size,
                 .write_buffer_size = config.tcp.write_buffer_size,
+            },
+            .ssl = SslConfig{
+                .enabled = config.ssl.enabled,
+                .port = config.ssl.port,
+                .cert_file = try allocator.dupe(u8, config.ssl.cert_file),
+                .key_file = try allocator.dupe(u8, config.ssl.key_file),
+                .ca_file = if (config.ssl.ca_file) |ca_file| try allocator.dupe(u8, ca_file) else null,
+                .verify_client = config.ssl.verify_client,
+                .cipher_suites = try allocator.dupe(u8, config.ssl.cipher_suites),
+                .min_protocol_version = config.ssl.min_protocol_version,
+                .max_protocol_version = config.ssl.max_protocol_version,
             },
             .storage = WombatStorageConfig{
                 .data_dir = try allocator.dupe(u8, config.storage.data_dir),
@@ -217,6 +304,15 @@ pub const Config = struct {
                 .timeout = config.cli.timeout,
                 .require_auth = config.cli.require_auth,
                 .max_connections = config.cli.max_connections,
+            },
+            .metrics = MetricsConfig{
+                .enabled = config.metrics.enabled,
+                .host = try allocator.dupe(u8, config.metrics.host),
+                .port = config.metrics.port,
+                .collection_interval_ms = config.metrics.collection_interval_ms,
+                .prometheus_enabled = config.metrics.prometheus_enabled,
+                .json_enabled = config.metrics.json_enabled,
+                .health_check_enabled = config.metrics.health_check_enabled,
             },
         };
     }

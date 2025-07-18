@@ -118,7 +118,7 @@ pub const BasicHandler = struct {
         _ = mandatory;
         _ = immediate;
 
-        // For now, just acknowledge the publish command without implementing full message routing
+        // TODO: For now, just acknowledge the publish command without implementing full message routing
         // This would need content header and body frame handling
 
         std.log.debug("Basic.Publish handled for connection {}, channel {}: {s} -> {s}", .{ connection.id, channel_id, exchange_name, routing_key });
@@ -244,7 +244,7 @@ pub const BasicHandler = struct {
         _ = exclusive;
         _ = arguments_data;
 
-        // For now, just acknowledge the consume command
+        // TODO: For now, just acknowledge the consume command
         // Full consumer implementation would require message delivery
 
         // Send Basic.ConsumeOk if not no-wait
@@ -328,7 +328,7 @@ pub const BasicHandler = struct {
 
         // Cancel consumer - stub implementation
 
-        // For now, just acknowledge the cancel command
+        // TODO: For now, just acknowledge the cancel command
 
         // Send Basic.CancelOk if not no-wait
         if (!no_wait) {
@@ -422,7 +422,7 @@ pub const BasicHandler = struct {
         // Get message from queue - stub implementation
         _ = no_ack;
 
-        // For now, always return empty (no messages available)
+        // TODO: For now, always return empty (no messages available)
         try self.sendBasicGetEmpty(connection, channel_id);
 
         std.log.debug("Basic.Get handled for connection {}, channel {}: {s}", .{ connection.id, channel_id, queue_name });
@@ -512,7 +512,7 @@ pub const BasicHandler = struct {
 
         // Acknowledge message(s) - stub implementation
 
-        // For now, just acknowledge the ack command
+        // TODO: For now, just acknowledge the ack command
 
         std.log.debug("Basic.Ack handled for connection {}, channel {}: delivery_tag={}, multiple={}", .{ connection.id, channel_id, delivery_tag, multiple });
     }
@@ -542,7 +542,7 @@ pub const BasicHandler = struct {
 
         // Negative acknowledge message(s) - stub implementation
 
-        // For now, just acknowledge the nack command
+        // TODO: For now, just acknowledge the nack command
 
         std.log.debug("Basic.Nack handled for connection {}, channel {}: delivery_tag={}, multiple={}, requeue={}", .{ connection.id, channel_id, delivery_tag, multiple, requeue });
     }
@@ -571,7 +571,7 @@ pub const BasicHandler = struct {
 
         // Reject message - stub implementation
 
-        // For now, just acknowledge the reject command
+        // TODO: For now, just acknowledge the reject command
 
         std.log.debug("Basic.Reject handled for connection {}, channel {}: delivery_tag={}, requeue={}", .{ connection.id, channel_id, delivery_tag, requeue });
     }
@@ -599,7 +599,7 @@ pub const BasicHandler = struct {
 
         // Recover unacknowledged messages - stub implementation
 
-        // For now, just acknowledge the recover command
+        // TODO: For now, just acknowledge the recover command
 
         // Send Basic.RecoverOk
         try self.sendBasicRecoverOk(connection, channel_id);

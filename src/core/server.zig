@@ -9,6 +9,11 @@ const Exchange = @import("../routing/exchange.zig").Exchange;
 const ErrorHandler = @import("../error/error_handler.zig").ErrorHandler;
 const ErrorHelpers = @import("../error/error_handler.zig").ErrorHelpers;
 const RecoveryAction = @import("../error/error_handler.zig").RecoveryAction;
+const MetricsRegistry = @import("../metrics/metrics.zig").MetricsRegistry;
+const MetricsHttpServer = @import("../metrics/http_server.zig").MetricsHttpServer;
+const BrokerMetricsCollector = @import("../metrics/broker_collector.zig").BrokerMetricsCollector;
+const SslContext = @import("../network/ssl.zig").SslContext;
+const SslListener = @import("../network/ssl.zig").SslListener;
 
 // Context structure for CLI client thread
 const CliClientContext = struct {
@@ -42,12 +47,20 @@ pub const Server = struct {
     next_cli_client_id: std.atomic.Value(u64),
     running: bool,
     tcp_server: ?std.net.Server,
+    ssl_context: ?SslContext,
+    ssl_listener: ?SslListener,
+    ssl_thread: ?std.Thread,
     cli_server: ?std.net.Server,
     cli_thread: ?std.Thread,
     protocol_handler: ProtocolHandler,
     persistence_mutex: std.Thread.Mutex,
     error_handler: ErrorHandler,
     shutdown_requested: std.atomic.Value(bool),
+
+    // Metrics components
+    metrics_registry: ?MetricsRegistry,
+    metrics_http_server: ?MetricsHttpServer,
+    metrics_collector: ?BrokerMetricsCollector,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Server {
         const protocol_handler = ProtocolHandler.init(allocator);
@@ -61,12 +74,18 @@ pub const Server = struct {
             .next_cli_client_id = std.atomic.Value(u64).init(1),
             .running = false,
             .tcp_server = null,
+            .ssl_context = null,
+            .ssl_listener = null,
+            .ssl_thread = null,
             .cli_server = null,
             .cli_thread = null,
             .protocol_handler = protocol_handler,
             .persistence_mutex = std.Thread.Mutex{},
             .error_handler = ErrorHandler.init(allocator),
             .shutdown_requested = std.atomic.Value(bool).init(false),
+            .metrics_registry = null,
+            .metrics_http_server = null,
+            .metrics_collector = null,
         };
 
         // Set up global server reference for persistence callback
@@ -80,6 +99,16 @@ pub const Server = struct {
 
         // Create default virtual host
         try server.createVirtualHost("/");
+
+        // Initialize SSL context if enabled
+        if (server.config.ssl.enabled) {
+            try server.initializeSsl();
+        }
+
+        // Initialize metrics if enabled
+        if (server.config.metrics.enabled) {
+            try server.initializeMetrics();
+        }
 
         // Recover persistent state from storage
         server.recoverPersistentState() catch |err| {
@@ -108,6 +137,30 @@ pub const Server = struct {
             thread.join();
         }
 
+        // Wait for SSL thread to finish if it's running
+        if (self.ssl_thread) |thread| {
+            thread.join();
+        }
+
+        // Clean up SSL components
+        if (self.ssl_listener) |*ssl_listener| {
+            ssl_listener.deinit();
+        }
+        if (self.ssl_context) |*ssl_context| {
+            ssl_context.deinit();
+        }
+
+        // Clean up metrics components
+        if (self.metrics_collector) |*collector| {
+            collector.deinit();
+        }
+        if (self.metrics_http_server) |*http_server| {
+            http_server.deinit();
+        }
+        if (self.metrics_registry) |*registry| {
+            registry.deinit();
+        }
+
         // Clean up error handler
         self.error_handler.deinit();
 
@@ -132,7 +185,7 @@ pub const Server = struct {
     }
 
     pub fn start(self: *Server) !void {
-        std.log.info("Starting Yak AMQP server on {s}:{}", .{ self.config.tcp.host, self.config.tcp.port });
+        std.log.info("Starting Yak AMQP server on {s}:{d}", .{ self.config.tcp.host, self.config.tcp.port });
 
         const address = try std.net.Address.parseIp(self.config.tcp.host, self.config.tcp.port);
         self.tcp_server = try address.listen(.{
@@ -167,7 +220,7 @@ pub const Server = struct {
     }
 
     pub fn startWithShutdownMonitoring(self: *Server, shutdown_flag: *const bool) !void {
-        std.log.info("Starting Yak AMQP server on {s}:{}", .{ self.config.tcp.host, self.config.tcp.port });
+        std.log.info("Starting Yak AMQP server on {s}:{d}", .{ self.config.tcp.host, self.config.tcp.port });
 
         const address = try std.net.Address.parseIp(self.config.tcp.host, self.config.tcp.port);
         self.tcp_server = try address.listen(.{
@@ -353,7 +406,7 @@ pub const Server = struct {
     fn handleCliConnection(self: *Server, connection: std.net.Server.Connection) !void {
         std.log.debug("Processing CLI client connection", .{});
 
-        // For now, send a simple welcome message and close
+        // TODO: For now, send a simple welcome message and close
         // This will be expanded with actual CLI protocol handling
         const welcome_msg = "Welcome to Yak AMQP Broker CLI\nType 'help' for available commands\n> ";
         try connection.stream.writeAll(welcome_msg);
@@ -368,7 +421,7 @@ pub const Server = struct {
 
             // Basic command handling
             if (std.mem.eql(u8, command, "help")) {
-                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  list queues [vhost] - List all queues in virtual host (default: /)\n  list exchanges [vhost] - List all exchanges in virtual host (default: /)\n  list connections - List all active client connections\n  list vhosts - List all virtual hosts\n  queue info <name> [vhost] - Show detailed information about a queue\n  queue declare <name> [--durable] [--exclusive] [--auto-delete] [vhost] - Create a new queue\n  queue delete <name> [--if-unused] [--if-empty] [vhost] - Delete a queue\n  queue purge <name> [vhost] - Remove all messages from a queue\n  exchange declare <name> <type> [--durable] [--auto-delete] [vhost] - Create a new exchange\n  exchange delete <name> [--if-unused] [vhost] - Delete an exchange\n  vhost create <name> - Create a new virtual host\n  vhost delete <name> - Delete a virtual host\n  vhost info <name> - Show detailed information about a virtual host\n  exit - Close connection\n";
+                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  metrics - Show server metrics\n  list queues [vhost] - List all queues in virtual host (default: /)\n  list exchanges [vhost] - List all exchanges in virtual host (default: /)\n  list connections - List all active client connections\n  list vhosts - List all virtual hosts\n  queue info <name> [vhost] - Show detailed information about a queue\n  queue declare <name> [--durable] [--exclusive] [--auto-delete] [vhost] - Create a new queue\n  queue delete <name> [--if-unused] [--if-empty] [vhost] - Delete a queue\n  queue purge <name> [vhost] - Remove all messages from a queue\n  exchange declare <name> <type> [--durable] [--auto-delete] [vhost] - Create a new exchange\n  exchange delete <name> [--if-unused] [vhost] - Delete an exchange\n  vhost create <name> - Create a new virtual host\n  vhost delete <name> - Delete a virtual host\n  vhost info <name> - Show detailed information about a virtual host\n  exit - Close connection\n";
                 try connection.stream.writeAll(help_msg);
             } else if (std.mem.startsWith(u8, command, "list queues")) {
                 try self.handleListQueuesCommand(connection, command);
@@ -396,6 +449,8 @@ pub const Server = struct {
                 try self.handleVHostDeleteCommand(connection, command);
             } else if (std.mem.startsWith(u8, command, "vhost info")) {
                 try self.handleVHostInfoCommand(connection, command);
+            } else if (std.mem.eql(u8, command, "metrics")) {
+                try self.handleMetricsCommand(connection, command);
             } else if (std.mem.eql(u8, command, "status")) {
                 const status_msg = try std.fmt.allocPrint(self.allocator, "Server Status:\n  Running: {}\n  Connections: {}\n  Virtual Hosts: {}\n  Shutdown Requested: {}\n", .{
                     self.running,
@@ -1178,6 +1233,54 @@ pub const Server = struct {
         try connection.stream.writeAll(vhost_info);
     }
 
+    fn handleMetricsCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        _ = command; // No additional parameters needed for metrics
+
+        if (self.metrics_registry) |*registry| {
+            const metrics_json = registry.getAllMetrics(self.allocator) catch |err| {
+                const error_msg = try std.fmt.allocPrint(self.allocator, "Error getting metrics: {}\n", .{err});
+                defer self.allocator.free(error_msg);
+                try connection.stream.writeAll(error_msg);
+                return;
+            };
+            defer {
+                var mutable_map = metrics_json.object;
+                mutable_map.deinit();
+            }
+
+            const json_string = std.json.stringifyAlloc(self.allocator, metrics_json, .{ .whitespace = .indent_2 }) catch |err| {
+                const error_msg = try std.fmt.allocPrint(self.allocator, "Error formatting metrics: {}\n", .{err});
+                defer self.allocator.free(error_msg);
+                try connection.stream.writeAll(error_msg);
+                return;
+            };
+            defer self.allocator.free(json_string);
+
+            const metrics_header = try std.fmt.allocPrint(self.allocator,
+                \\Server Metrics:
+                \\  Metrics HTTP Server: http://{s}:{}
+                \\  Prometheus Endpoint: http://{s}:{}/metrics
+                \\  JSON Endpoint: http://{s}:{}/metrics/json
+                \\  Health Check: http://{s}:{}/health
+                \\
+                \\Current Metrics:
+                \\{s}
+                \\
+            , .{
+                self.config.metrics.host, self.config.metrics.port,
+                self.config.metrics.host, self.config.metrics.port,
+                self.config.metrics.host, self.config.metrics.port,
+                self.config.metrics.host, self.config.metrics.port,
+                json_string,
+            });
+            defer self.allocator.free(metrics_header);
+            try connection.stream.writeAll(metrics_header);
+        } else {
+            const no_metrics_msg = "Metrics collection is disabled. Enable metrics in configuration to view metrics.\n";
+            try connection.stream.writeAll(no_metrics_msg);
+        }
+    }
+
     fn handleConnectionWithRecovery(self: *Server, client_socket: std.net.Server.Connection) void {
         self.handleConnection(client_socket) catch {
             const error_info = ErrorHelpers.connectionError(.connection_forced, "Failed to initialize connection", 0);
@@ -1551,6 +1654,178 @@ pub const Server = struct {
         self.error_handler.clearOldErrors(3600);
 
         std.log.debug("Performed server maintenance: cleared old errors", .{});
+    }
+
+    /// Initialize metrics collection and HTTP server
+    fn initializeSsl(self: *Server) !void {
+        // Initialize SSL context
+        self.ssl_context = try SslContext.init(self.config.ssl, self.allocator);
+
+        // Create SSL listener
+        const ssl_address = try std.net.Address.parseIp(self.config.tcp.host, self.config.ssl.port);
+        self.ssl_listener = try self.ssl_context.?.listen(ssl_address);
+
+        // Start SSL server thread
+        self.ssl_thread = try std.Thread.spawn(.{}, sslServerThread, .{self});
+
+        std.log.info("SSL/TLS server initialized - listening on {s}:{d}", .{ self.config.tcp.host, self.config.ssl.port });
+    }
+
+    fn sslServerThread(self: *Server) void {
+        std.log.info("SSL server thread started", .{});
+
+        while (self.running and !self.shutdown_requested.load(.monotonic)) {
+            if (self.ssl_listener) |*ssl_listener| {
+                const ssl_connection = ssl_listener.acceptTimeout(100) catch |err| switch (err) {
+                    error.WouldBlock => continue,
+                    else => {
+                        std.log.warn("Failed to accept SSL connection: {}", .{err});
+                        continue;
+                    },
+                };
+
+                if (ssl_connection) |ssl_conn| {
+                    // Handle SSL connection
+                    self.handleSslConnection(ssl_conn);
+                }
+            }
+        }
+
+        std.log.info("SSL server thread stopped", .{});
+    }
+
+    fn handleSslConnection(self: *Server, mut_ssl_conn: @import("../network/ssl.zig").SslConnection) void {
+        var ssl_conn = mut_ssl_conn;
+        defer ssl_conn.deinit();
+
+        // Perform SSL handshake
+        ssl_conn.handshake(self.allocator) catch |err| {
+            std.log.warn("SSL handshake failed: {}", .{err});
+            return;
+        };
+
+        // Create network connection wrapper
+        const connection_id = self.next_connection_id;
+        self.next_connection_id += 1;
+
+        var network_connection = NetworkConnection.init(self.allocator, connection_id, ssl_conn.stream) catch |err| {
+            std.log.warn("Failed to create network connection: {}", .{err});
+            return;
+        };
+        defer network_connection.deinit();
+
+        // Add to connections list
+        self.connections.append(&network_connection) catch |err| {
+            std.log.warn("Failed to add SSL connection to list: {}", .{err});
+            return;
+        };
+
+        std.log.info("SSL connection established: {} from {any}", .{ connection_id, ssl_conn.address });
+
+        // Handle connection with protocol handler
+        self.protocol_handler.handleConnection(&network_connection) catch |err| {
+            std.log.warn("SSL connection protocol handling failed: {}", .{err});
+            return;
+        };
+
+        // Remove from connections list
+        for (self.connections.items, 0..) |conn, i| {
+            if (conn.id == connection_id) {
+                _ = self.connections.orderedRemove(i);
+                break;
+            }
+        }
+
+        std.log.info("SSL connection closed: {}", .{connection_id});
+    }
+
+    fn initializeMetrics(self: *Server) !void {
+        // Initialize metrics registry
+        self.metrics_registry = MetricsRegistry.init(self.allocator);
+
+        // Initialize HTTP server
+        self.metrics_http_server = try MetricsHttpServer.init(self.allocator, &self.metrics_registry.?, self.config.metrics.host, self.config.metrics.port);
+
+        // Initialize metrics collector
+        self.metrics_collector = BrokerMetricsCollector.init(&self.metrics_registry.?, self, self.config.metrics.collection_interval_ms);
+
+        // Start metrics collection
+        try self.metrics_collector.?.start();
+
+        // Start HTTP server
+        try self.metrics_http_server.?.start();
+
+        std.log.info("Metrics system initialized - HTTP server on {s}:{d}", .{ self.config.metrics.host, self.config.metrics.port });
+    }
+
+    /// Get metrics registry for external access
+    pub fn getMetricsRegistry(self: *Server) ?*MetricsRegistry {
+        return if (self.metrics_registry) |*registry| registry else null;
+    }
+
+    /// Record connection opened metric
+    pub fn recordConnectionOpened(self: *Server) void {
+        if (self.metrics_registry) |*registry| {
+            registry.incrementCounter("amqp_connections_opened_total", 1) catch {};
+        }
+    }
+
+    /// Record connection closed metric
+    pub fn recordConnectionClosed(self: *Server) void {
+        if (self.metrics_registry) |*registry| {
+            registry.incrementCounter("amqp_connections_closed_total", 1) catch {};
+        }
+    }
+
+    /// Record message published metric
+    pub fn recordMessagePublished(self: *Server, bytes: usize) void {
+        if (self.metrics_registry) |*registry| {
+            registry.incrementCounter("amqp_messages_published_total", 1) catch {};
+            registry.incrementCounter("amqp_bytes_received_total", bytes) catch {};
+        }
+    }
+
+    /// Record message delivered metric
+    pub fn recordMessageDelivered(self: *Server, bytes: usize) void {
+        if (self.metrics_registry) |*registry| {
+            registry.incrementCounter("amqp_messages_delivered_total", 1) catch {};
+            registry.incrementCounter("amqp_bytes_sent_total", bytes) catch {};
+        }
+    }
+
+    /// Record message acknowledged metric
+    pub fn recordMessageAcknowledged(self: *Server) void {
+        if (self.metrics_registry) |*registry| {
+            registry.incrementCounter("amqp_messages_acknowledged_total", 1) catch {};
+        }
+    }
+
+    /// Record message rejected metric
+    pub fn recordMessageRejected(self: *Server) void {
+        if (self.metrics_registry) |*registry| {
+            registry.incrementCounter("amqp_messages_rejected_total", 1) catch {};
+        }
+    }
+
+    /// Record processing duration metric
+    pub fn recordProcessingDuration(self: *Server, metric_name: []const u8, duration_ns: u64) void {
+        if (self.metrics_registry) |*registry| {
+            const duration_seconds = @as(f64, @floatFromInt(duration_ns)) / 1_000_000_000.0;
+            registry.observeHistogram(metric_name, duration_seconds) catch {};
+        }
+    }
+
+    /// Record error metric
+    pub fn recordError(self: *Server, error_type: []const u8) void {
+        if (self.metrics_registry) |*registry| {
+            registry.incrementCounter("amqp_errors_total", 1) catch {};
+
+            if (std.mem.eql(u8, error_type, "protocol")) {
+                registry.incrementCounter("amqp_protocol_errors_total", 1) catch {};
+            } else if (std.mem.eql(u8, error_type, "connection")) {
+                registry.incrementCounter("amqp_connection_errors_total", 1) catch {};
+            }
+        }
     }
 };
 

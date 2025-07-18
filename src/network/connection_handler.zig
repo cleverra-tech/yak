@@ -262,7 +262,7 @@ pub const ConnectionHandler = struct {
         const username = response[first_null.? + 1 .. second_null.?];
         const password = response[second_null.? + 1 ..];
 
-        // For now, accept any non-empty username/password combination
+        // TODO: For now, accept any non-empty username/password combination
         // In a production system, this would validate against a user database
         if (username.len == 0 or password.len == 0) {
             const error_info = ErrorHelpers.connectionError(.access_refused, "Empty username or password", connection.id);
@@ -352,7 +352,7 @@ pub const ConnectionHandler = struct {
 
         const vhost_name = payload[1 .. 1 + vhost_len];
 
-        // For now, we'll accept any virtual host name
+        // TODO: For now, we'll accept any virtual host name
         // In a production system, this would validate against configured vhosts
         try connection.setVirtualHost(vhost_name);
         connection.setState(.open);

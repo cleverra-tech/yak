@@ -443,6 +443,6 @@ test "metadata storage operations" {
     const allocator = std.testing.allocator;
 
     // This test would need a real WombatAdapter instance
-    // For now, we'll skip the actual storage tests
+    // TODO: For now, we'll skip the actual storage tests
     std.testing.skip();
 }
