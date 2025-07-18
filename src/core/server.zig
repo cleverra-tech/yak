@@ -368,7 +368,7 @@ pub const Server = struct {
 
             // Basic command handling
             if (std.mem.eql(u8, command, "help")) {
-                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  list queues [vhost] - List all queues in virtual host (default: /)\n  list exchanges [vhost] - List all exchanges in virtual host (default: /)\n  queue info <name> [vhost] - Show detailed information about a queue\n  queue declare <name> [--durable] [--exclusive] [--auto-delete] [vhost] - Create a new queue\n  queue delete <name> [--if-unused] [--if-empty] [vhost] - Delete a queue\n  queue purge <name> [vhost] - Remove all messages from a queue\n  exchange declare <name> <type> [--durable] [--auto-delete] [vhost] - Create a new exchange\n  exchange delete <name> [--if-unused] [vhost] - Delete an exchange\n  exit - Close connection\n";
+                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  list queues [vhost] - List all queues in virtual host (default: /)\n  list exchanges [vhost] - List all exchanges in virtual host (default: /)\n  list connections - List all active client connections\n  list vhosts - List all virtual hosts\n  queue info <name> [vhost] - Show detailed information about a queue\n  queue declare <name> [--durable] [--exclusive] [--auto-delete] [vhost] - Create a new queue\n  queue delete <name> [--if-unused] [--if-empty] [vhost] - Delete a queue\n  queue purge <name> [vhost] - Remove all messages from a queue\n  exchange declare <name> <type> [--durable] [--auto-delete] [vhost] - Create a new exchange\n  exchange delete <name> [--if-unused] [vhost] - Delete an exchange\n  vhost create <name> - Create a new virtual host\n  vhost delete <name> - Delete a virtual host\n  vhost info <name> - Show detailed information about a virtual host\n  exit - Close connection\n";
                 try connection.stream.writeAll(help_msg);
             } else if (std.mem.startsWith(u8, command, "list queues")) {
                 try self.handleListQueuesCommand(connection, command);
@@ -386,6 +386,16 @@ pub const Server = struct {
                 try self.handleExchangeDeleteCommand(connection, command);
             } else if (std.mem.startsWith(u8, command, "list exchanges")) {
                 try self.handleListExchangesCommand(connection, command);
+            } else if (std.mem.startsWith(u8, command, "list connections")) {
+                try self.handleListConnectionsCommand(connection, command);
+            } else if (std.mem.startsWith(u8, command, "list vhosts")) {
+                try self.handleListVHostsCommand(connection, command);
+            } else if (std.mem.startsWith(u8, command, "vhost create")) {
+                try self.handleVHostCreateCommand(connection, command);
+            } else if (std.mem.startsWith(u8, command, "vhost delete")) {
+                try self.handleVHostDeleteCommand(connection, command);
+            } else if (std.mem.startsWith(u8, command, "vhost info")) {
+                try self.handleVHostInfoCommand(connection, command);
             } else if (std.mem.eql(u8, command, "status")) {
                 const status_msg = try std.fmt.allocPrint(self.allocator, "Server Status:\n  Running: {}\n  Connections: {}\n  Virtual Hosts: {}\n  Shutdown Requested: {}\n", .{
                     self.running,
@@ -966,6 +976,208 @@ pub const Server = struct {
         try connection.stream.writeAll(success_msg);
     }
 
+    fn handleListConnectionsCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        _ = command; // No additional parameters needed for listing connections
+
+        // Format and send connection list
+        if (self.connections.items.len == 0) {
+            const no_connections_msg = "No active client connections\n";
+            try connection.stream.writeAll(no_connections_msg);
+        } else {
+            const header_msg = try std.fmt.allocPrint(self.allocator, "Active client connections ({}):\n", .{self.connections.items.len});
+            defer self.allocator.free(header_msg);
+            try connection.stream.writeAll(header_msg);
+
+            for (self.connections.items) |conn| {
+                const vhost_name = conn.virtual_host orelse "none";
+                const state_name = @tagName(conn.state);
+                const channel_count = conn.channels.count();
+
+                const connection_info = try std.fmt.allocPrint(self.allocator,
+                    \\  Connection ID: {}
+                    \\    State: {s}
+                    \\    Virtual Host: {s}
+                    \\    Authenticated: {}
+                    \\    Channels: {}
+                    \\    Heartbeat Interval: {}s
+                    \\    Max Frame Size: {} bytes
+                    \\    Blocked: {}
+                    \\
+                , .{
+                    conn.id,
+                    state_name,
+                    vhost_name,
+                    conn.authenticated,
+                    channel_count,
+                    conn.heartbeat_interval,
+                    conn.max_frame_size,
+                    conn.blocked,
+                });
+                defer self.allocator.free(connection_info);
+                try connection.stream.writeAll(connection_info);
+            }
+        }
+    }
+
+    fn handleListVHostsCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        _ = command; // No additional parameters needed for listing virtual hosts
+
+        // Get list of virtual hosts
+        const vhost_names = self.listVirtualHosts(self.allocator) catch |err| {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error listing virtual hosts: {}\n", .{err});
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+        defer {
+            for (vhost_names) |name| {
+                self.allocator.free(name);
+            }
+            self.allocator.free(vhost_names);
+        }
+
+        // Format and send response
+        const header_msg = try std.fmt.allocPrint(self.allocator, "Virtual hosts ({}):\n", .{vhost_names.len});
+        defer self.allocator.free(header_msg);
+        try connection.stream.writeAll(header_msg);
+
+        for (vhost_names) |vhost_name| {
+            const vhost = self.getVirtualHost(vhost_name).?;
+            const vhost_info = try std.fmt.allocPrint(self.allocator, "  {s} (queues: {}, exchanges: {}, active: {})\n", .{
+                vhost_name,
+                vhost.getQueueCount(),
+                vhost.getExchangeCount(),
+                vhost.active,
+            });
+            defer self.allocator.free(vhost_info);
+            try connection.stream.writeAll(vhost_info);
+        }
+    }
+
+    fn handleVHostCreateCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        // Parse command to extract virtual host name
+        var parts = std.mem.splitSequence(u8, command, " ");
+        _ = parts.next(); // "vhost"
+        _ = parts.next(); // "create"
+
+        const vhost_name = parts.next() orelse {
+            const error_msg = "Error: Virtual host name is required. Usage: vhost create <name>\n";
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        // Create the virtual host
+        self.createVirtualHost(vhost_name) catch |err| {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error creating virtual host '{s}': {}\n", .{ vhost_name, err });
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        // Send success response
+        const success_msg = try std.fmt.allocPrint(self.allocator,
+            \\Virtual host created successfully: {s}
+            \\  Active: true
+            \\  Queues: 0
+            \\  Exchanges: {} (default exchanges)
+            \\
+        , .{
+            vhost_name,
+            self.getVirtualHost(vhost_name).?.getExchangeCount(),
+        });
+        defer self.allocator.free(success_msg);
+        try connection.stream.writeAll(success_msg);
+    }
+
+    fn handleVHostDeleteCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        // Parse command to extract virtual host name
+        var parts = std.mem.splitSequence(u8, command, " ");
+        _ = parts.next(); // "vhost"
+        _ = parts.next(); // "delete"
+
+        const vhost_name = parts.next() orelse {
+            const error_msg = "Error: Virtual host name is required. Usage: vhost delete <name>\n";
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        // Check if virtual host exists
+        const vhost = self.getVirtualHost(vhost_name);
+        if (vhost == null) {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error: Virtual host '{s}' not found\n", .{vhost_name});
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        }
+
+        // Delete the virtual host
+        self.deleteVirtualHost(vhost_name) catch |err| {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error deleting virtual host '{s}': {}\n", .{ vhost_name, err });
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        // Send success response
+        const success_msg = try std.fmt.allocPrint(self.allocator,
+            \\Virtual host deleted successfully: {s}
+            \\
+        , .{vhost_name});
+        defer self.allocator.free(success_msg);
+        try connection.stream.writeAll(success_msg);
+    }
+
+    fn handleVHostInfoCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        // Parse command to extract virtual host name
+        var parts = std.mem.splitSequence(u8, command, " ");
+        _ = parts.next(); // "vhost"
+        _ = parts.next(); // "info"
+
+        const vhost_name = parts.next() orelse {
+            const error_msg = "Error: Virtual host name is required. Usage: vhost info <name>\n";
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        // Get the virtual host
+        const vhost = self.getVirtualHost(vhost_name);
+        if (vhost == null) {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error: Virtual host '{s}' not found\n", .{vhost_name});
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        }
+
+        // Get virtual host statistics
+        var stats = vhost.?.getStats(self.allocator) catch |err| {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error getting virtual host stats: {}\n", .{err});
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+        defer stats.object.deinit();
+
+        // Format and send detailed virtual host information
+        const vhost_info = try std.fmt.allocPrint(self.allocator,
+            \\Virtual Host Information: {s}
+            \\  Active: {}
+            \\  Queues: {}
+            \\  Exchanges: {}
+            \\  Total Messages: {}
+            \\  Total Consumers: {}
+            \\
+        , .{
+            vhost_name,
+            vhost.?.active,
+            vhost.?.getQueueCount(),
+            vhost.?.getExchangeCount(),
+            stats.object.get("total_messages").?.integer,
+            stats.object.get("total_consumers").?.integer,
+        });
+        defer self.allocator.free(vhost_info);
+        try connection.stream.writeAll(vhost_info);
+    }
+
     fn handleConnectionWithRecovery(self: *Server, client_socket: std.net.Server.Connection) void {
         self.handleConnection(client_socket) catch {
             const error_info = ErrorHelpers.connectionError(.connection_forced, "Failed to initialize connection", 0);
@@ -1063,12 +1275,40 @@ pub const Server = struct {
         return self.vhosts.get(name);
     }
 
+    pub fn deleteVirtualHost(self: *Server, name: []const u8) !void {
+        // Don't allow deleting the default virtual host
+        if (std.mem.eql(u8, name, "/")) {
+            return error.CannotDeleteDefaultVHost;
+        }
+
+        if (self.vhosts.fetchRemove(name)) |entry| {
+            entry.value.deinit();
+            self.allocator.destroy(entry.value);
+            self.allocator.free(entry.key);
+            std.log.info("Virtual host deleted: {s}", .{name});
+        } else {
+            return error.VirtualHostNotFound;
+        }
+    }
+
     pub fn getConnectionCount(self: *const Server) u32 {
         return @intCast(self.connections.items.len);
     }
 
     pub fn getVirtualHostCount(self: *const Server) u32 {
         return @intCast(self.vhosts.count());
+    }
+
+    pub fn listVirtualHosts(self: *Server, allocator: std.mem.Allocator) ![][]const u8 {
+        var vhost_list = std.ArrayList([]const u8).init(allocator);
+        defer vhost_list.deinit();
+
+        var iterator = self.vhosts.iterator();
+        while (iterator.next()) |entry| {
+            try vhost_list.append(try allocator.dupe(u8, entry.key_ptr.*));
+        }
+
+        return vhost_list.toOwnedSlice();
     }
 
     /// Request graceful shutdown
@@ -1508,4 +1748,66 @@ test "server exchange commands handling" {
     try vhost.deleteExchange("test-fanout", false);
     try std.testing.expectEqual(initial_count, vhost.getExchangeCount());
     try std.testing.expect(vhost.getExchange("test-fanout") == null);
+}
+
+test "server connection listing functionality" {
+    const allocator = std.testing.allocator;
+
+    var config = try Config.default(allocator);
+    defer config.deinit(allocator);
+
+    var server = try Server.init(allocator, config);
+    defer server.deinit();
+
+    // Initially no connections
+    try std.testing.expectEqual(@as(u32, 0), server.getConnectionCount());
+
+    // The connections list should be empty
+    try std.testing.expectEqual(@as(usize, 0), server.connections.items.len);
+}
+
+test "server virtual host management" {
+    const allocator = std.testing.allocator;
+
+    var config = try Config.default(allocator);
+    defer config.deinit(allocator);
+
+    var server = try Server.init(allocator, config);
+    defer server.deinit();
+
+    // Should start with default virtual host
+    try std.testing.expectEqual(@as(u32, 1), server.getVirtualHostCount());
+    try std.testing.expect(server.getVirtualHost("/") != null);
+
+    // Test creating virtual hosts
+    try server.createVirtualHost("test1");
+    try server.createVirtualHost("test2");
+    try std.testing.expectEqual(@as(u32, 3), server.getVirtualHostCount());
+
+    // Test getting virtual hosts
+    try std.testing.expect(server.getVirtualHost("test1") != null);
+    try std.testing.expect(server.getVirtualHost("test2") != null);
+    try std.testing.expect(server.getVirtualHost("nonexistent") == null);
+
+    // Test listing virtual hosts
+    const vhost_names = try server.listVirtualHosts(allocator);
+    defer {
+        for (vhost_names) |name| {
+            allocator.free(name);
+        }
+        allocator.free(vhost_names);
+    }
+    try std.testing.expectEqual(@as(usize, 3), vhost_names.len);
+
+    // Test deleting virtual hosts
+    try server.deleteVirtualHost("test1");
+    try std.testing.expectEqual(@as(u32, 2), server.getVirtualHostCount());
+    try std.testing.expect(server.getVirtualHost("test1") == null);
+
+    // Test that we can't delete the default virtual host
+    try std.testing.expectError(error.CannotDeleteDefaultVHost, server.deleteVirtualHost("/"));
+    try std.testing.expectEqual(@as(u32, 2), server.getVirtualHostCount());
+
+    // Test deleting non-existent virtual host
+    try std.testing.expectError(error.VirtualHostNotFound, server.deleteVirtualHost("nonexistent"));
 }
