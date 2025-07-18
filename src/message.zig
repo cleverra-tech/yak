@@ -2,6 +2,32 @@ const std = @import("std");
 
 pub const HeaderTable = std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage);
 
+pub const DeathReason = enum {
+    rejected,
+    expired,
+    maxlen,
+    maxlen_bytes,
+    delivery_limit,
+};
+
+pub const DeathEvent = struct {
+    queue: []const u8,
+    reason: DeathReason,
+    exchange: []const u8,
+    routing_keys: [][]const u8,
+    count: u32,
+    time: i64,
+
+    pub fn deinit(self: *DeathEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.queue);
+        allocator.free(self.exchange);
+        for (self.routing_keys) |key| {
+            allocator.free(key);
+        }
+        allocator.free(self.routing_keys);
+    }
+};
+
 pub const Message = struct {
     id: u64,
     exchange: []const u8,
@@ -11,6 +37,13 @@ pub const Message = struct {
     persistent: bool,
     delivery_count: u32,
     timestamp: i64,
+
+    // Dead letter queue support
+    deaths: std.ArrayList(DeathEvent),
+    first_death_queue: ?[]const u8,
+    first_death_reason: ?DeathReason,
+    first_death_exchange: ?[]const u8,
+    max_delivery_count: ?u32,
 
     // Wombat storage metadata
     wombat_key: []const u8,
@@ -30,6 +63,11 @@ pub const Message = struct {
             .persistent = false,
             .delivery_count = 0,
             .timestamp = timestamp,
+            .deaths = std.ArrayList(DeathEvent).init(allocator),
+            .first_death_queue = null,
+            .first_death_reason = null,
+            .first_death_exchange = null,
+            .max_delivery_count = null,
             .wombat_key = &[_]u8{},
             // .value_pointer = null,
             .allocator = allocator,
@@ -52,6 +90,20 @@ pub const Message = struct {
 
         if (self.wombat_key.len > 0) {
             self.allocator.free(self.wombat_key);
+        }
+
+        // Clean up death events
+        for (self.deaths.items) |*death| {
+            death.deinit(self.allocator);
+        }
+        self.deaths.deinit();
+
+        // Clean up first death fields
+        if (self.first_death_queue) |queue| {
+            self.allocator.free(queue);
+        }
+        if (self.first_death_exchange) |exchange| {
+            self.allocator.free(exchange);
         }
     }
 
@@ -124,6 +176,11 @@ pub const Message = struct {
             .persistent = persistent,
             .delivery_count = delivery_count,
             .timestamp = @intCast(timestamp),
+            .deaths = std.ArrayList(DeathEvent).init(allocator),
+            .first_death_queue = null,
+            .first_death_reason = null,
+            .first_death_exchange = null,
+            .max_delivery_count = null,
             .wombat_key = &[_]u8{},
             // .value_pointer = null,
             .allocator = allocator,
@@ -152,7 +209,126 @@ pub const Message = struct {
             }
         }
 
+        // Copy death information
+        cloned.max_delivery_count = self.max_delivery_count;
+        if (self.first_death_queue) |queue| {
+            cloned.first_death_queue = try allocator.dupe(u8, queue);
+        }
+        if (self.first_death_exchange) |exchange| {
+            cloned.first_death_exchange = try allocator.dupe(u8, exchange);
+        }
+        cloned.first_death_reason = self.first_death_reason;
+
+        // Copy death events
+        for (self.deaths.items) |*death| {
+            var cloned_keys = try allocator.alloc([]u8, death.routing_keys.len);
+            for (death.routing_keys, 0..) |key, i| {
+                cloned_keys[i] = try allocator.dupe(u8, key);
+            }
+
+            const cloned_death = DeathEvent{
+                .queue = try allocator.dupe(u8, death.queue),
+                .reason = death.reason,
+                .exchange = try allocator.dupe(u8, death.exchange),
+                .routing_keys = cloned_keys,
+                .count = death.count,
+                .time = death.time,
+            };
+            try cloned.deaths.append(cloned_death);
+        }
+
         return cloned;
+    }
+
+    /// Add a death event to this message
+    pub fn addDeathEvent(self: *Message, queue: []const u8, reason: DeathReason, exchange: []const u8, routing_keys: [][]const u8) !void {
+        // Set first death information if not already set
+        if (self.first_death_queue == null) {
+            self.first_death_queue = try self.allocator.dupe(u8, queue);
+            self.first_death_reason = reason;
+            self.first_death_exchange = try self.allocator.dupe(u8, exchange);
+        }
+
+        // Check if we already have a death event for this queue and reason
+        for (self.deaths.items) |*death| {
+            if (std.mem.eql(u8, death.queue, queue) and death.reason == reason) {
+                death.count += 1;
+                death.time = std.time.timestamp();
+                return;
+            }
+        }
+
+        // Create new death event
+        var cloned_keys = try self.allocator.alloc([]u8, routing_keys.len);
+        for (routing_keys, 0..) |key, i| {
+            cloned_keys[i] = try self.allocator.dupe(u8, key);
+        }
+
+        const death_event = DeathEvent{
+            .queue = try self.allocator.dupe(u8, queue),
+            .reason = reason,
+            .exchange = try self.allocator.dupe(u8, exchange),
+            .routing_keys = cloned_keys,
+            .count = 1,
+            .time = std.time.timestamp(),
+        };
+
+        try self.deaths.append(death_event);
+    }
+
+    /// Check if message should be dead lettered based on delivery count
+    pub fn shouldDeadLetterForDeliveryCount(self: *const Message) bool {
+        if (self.max_delivery_count) |max_count| {
+            return self.delivery_count >= max_count;
+        }
+        return false;
+    }
+
+    /// Create a dead letter message with death headers
+    pub fn createDeadLetterMessage(self: *const Message, allocator: std.mem.Allocator, dl_exchange: []const u8, dl_routing_key: ?[]const u8) !Message {
+        var dead_letter = try self.clone(allocator);
+
+        // Override exchange and routing key for dead letter routing
+        allocator.free(dead_letter.exchange);
+        dead_letter.exchange = try allocator.dupe(u8, dl_exchange);
+
+        if (dl_routing_key) |routing_key| {
+            allocator.free(dead_letter.routing_key);
+            dead_letter.routing_key = try allocator.dupe(u8, routing_key);
+        }
+
+        // Add death headers to the message
+        try dead_letter.addDeathHeaders();
+
+        return dead_letter;
+    }
+
+    /// Add AMQP death headers to the message
+    fn addDeathHeaders(self: *Message) !void {
+        // Add x-death header with death events
+        if (self.deaths.items.len > 0) {
+            // In a real implementation, this would serialize the death events as AMQP arrays
+            // For now, we'll add basic death information
+            try self.setHeader("x-death", "present");
+        }
+
+        // Add first death information
+        if (self.first_death_queue) |queue| {
+            try self.setHeader("x-first-death-queue", queue);
+        }
+        if (self.first_death_exchange) |exchange| {
+            try self.setHeader("x-first-death-exchange", exchange);
+        }
+        if (self.first_death_reason) |reason| {
+            const reason_str = switch (reason) {
+                .rejected => "rejected",
+                .expired => "expired",
+                .maxlen => "maxlen",
+                .maxlen_bytes => "maxlen_bytes",
+                .delivery_limit => "delivery_limit",
+            };
+            try self.setHeader("x-first-death-reason", reason_str);
+        }
     }
 };
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const Message = @import("../message.zig").Message;
 const Consumer = @import("../consumer/consumer.zig").Consumer;
 const Binding = @import("binding.zig").Binding;
+const FieldTable = @import("../network/field_table.zig").FieldTable;
 
 pub const Queue = struct {
     name: []const u8,
@@ -14,6 +15,11 @@ pub const Queue = struct {
     messages: std.ArrayList(Message),
     max_length: ?u32,
     message_ttl: ?u32,
+
+    // Dead letter queue support
+    dead_letter_exchange: ?[]const u8,
+    dead_letter_routing_key: ?[]const u8,
+    max_delivery_count: ?u32,
 
     // Consumer management
     consumers: std.ArrayList(Consumer),
@@ -40,7 +46,7 @@ pub const Queue = struct {
         auto_delete: bool,
         arguments: ?[]const u8,
     ) !Queue {
-        return Queue{
+        var queue = Queue{
             .name = name,
             .durable = durable,
             .exclusive = exclusive,
@@ -49,6 +55,9 @@ pub const Queue = struct {
             .messages = std.ArrayList(Message).init(allocator),
             .max_length = null,
             .message_ttl = null,
+            .dead_letter_exchange = null,
+            .dead_letter_routing_key = null,
+            .max_delivery_count = null,
             .consumers = std.ArrayList(Consumer).init(allocator),
             .next_delivery_tag = 1,
             .bindings = std.ArrayList(Binding).init(allocator),
@@ -60,6 +69,13 @@ pub const Queue = struct {
             .allocator = allocator,
             .mutex = std.Thread.Mutex{},
         };
+
+        // Parse dead letter queue arguments
+        if (arguments) |args| {
+            try queue.parseDeadLetterArguments(args);
+        }
+
+        return queue;
     }
 
     pub fn deinit(self: *Queue) void {
@@ -86,6 +102,14 @@ pub const Queue = struct {
 
         if (self.arguments) |args| {
             self.allocator.free(args);
+        }
+
+        // Clean up dead letter fields
+        if (self.dead_letter_exchange) |exchange| {
+            self.allocator.free(exchange);
+        }
+        if (self.dead_letter_routing_key) |routing_key| {
+            self.allocator.free(routing_key);
         }
     }
 
@@ -385,6 +409,206 @@ pub const Queue = struct {
         try stats.put("bindings", std.json.Value{ .integer = @intCast(self.bindings.items.len) });
 
         return std.json.Value{ .object = stats };
+    }
+
+    /// Parse dead letter queue arguments from AMQP field table
+    fn parseDeadLetterArguments(self: *Queue, arguments: []const u8) !void {
+        // Try to parse as AMQP field table
+        var field_table = FieldTable.init(self.allocator);
+        var parsed_args = field_table.parse(arguments) catch |err| {
+            // If parsing fails, try simple key-value format as fallback
+            std.log.warn("Failed to parse arguments as AMQP field table: {}, using simple format", .{err});
+            try self.parseSimpleArguments(arguments);
+            return;
+        };
+        defer field_table.free(&parsed_args);
+
+        // Extract dead letter queue arguments
+        if (parsed_args.get("x-dead-letter-exchange")) |exchange_name| {
+            if (exchange_name.len > 0) {
+                self.dead_letter_exchange = try self.allocator.dupe(u8, exchange_name);
+            }
+        }
+
+        if (parsed_args.get("x-dead-letter-routing-key")) |routing_key| {
+            if (routing_key.len > 0) {
+                self.dead_letter_routing_key = try self.allocator.dupe(u8, routing_key);
+            }
+        }
+
+        if (parsed_args.get("x-max-delivery-count")) |count_str| {
+            self.max_delivery_count = std.fmt.parseUnsigned(u32, count_str, 10) catch null;
+        }
+
+        if (parsed_args.get("x-message-ttl")) |ttl_str| {
+            self.message_ttl = std.fmt.parseUnsigned(u32, ttl_str, 10) catch null;
+        }
+
+        if (parsed_args.get("x-max-length")) |length_str| {
+            self.max_length = std.fmt.parseUnsigned(u32, length_str, 10) catch null;
+        }
+    }
+
+    /// Fallback parser for simple key-value arguments format
+    fn parseSimpleArguments(self: *Queue, arguments: []const u8) !void {
+        var args_iter = std.mem.splitScalar(u8, arguments, ';');
+        while (args_iter.next()) |arg| {
+            if (std.mem.startsWith(u8, arg, "x-dead-letter-exchange=")) {
+                const exchange_name = arg[23..]; // Skip "x-dead-letter-exchange="
+                if (exchange_name.len > 0) {
+                    self.dead_letter_exchange = try self.allocator.dupe(u8, exchange_name);
+                }
+            } else if (std.mem.startsWith(u8, arg, "x-dead-letter-routing-key=")) {
+                const routing_key = arg[26..]; // Skip "x-dead-letter-routing-key="
+                if (routing_key.len > 0) {
+                    self.dead_letter_routing_key = try self.allocator.dupe(u8, routing_key);
+                }
+            } else if (std.mem.startsWith(u8, arg, "x-max-delivery-count=")) {
+                const count_str = arg[21..]; // Skip "x-max-delivery-count="
+                if (count_str.len > 0) {
+                    self.max_delivery_count = std.fmt.parseUnsigned(u32, count_str, 10) catch null;
+                }
+            } else if (std.mem.startsWith(u8, arg, "x-message-ttl=")) {
+                const ttl_str = arg[14..]; // Skip "x-message-ttl="
+                if (ttl_str.len > 0) {
+                    self.message_ttl = std.fmt.parseUnsigned(u32, ttl_str, 10) catch null;
+                }
+            } else if (std.mem.startsWith(u8, arg, "x-max-length=")) {
+                const length_str = arg[13..]; // Skip "x-max-length="
+                if (length_str.len > 0) {
+                    self.max_length = std.fmt.parseUnsigned(u32, length_str, 10) catch null;
+                }
+            }
+        }
+    }
+
+    /// Enhanced reject method with dead letter queue support
+    pub fn rejectWithDeadLetter(self: *Queue, delivery_tag: u64, requeue: bool, dead_letter_fn: ?*const fn (message: *Message) void) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.messages.items, 0..) |*message, i| {
+            if (message.id == delivery_tag) {
+                if (requeue) {
+                    // Move message back to ready state
+                    message.incrementDeliveryCount();
+
+                    // Check if message should be dead lettered due to delivery count
+                    if (self.max_delivery_count) |max_count| {
+                        if (message.delivery_count >= max_count) {
+                            // Dead letter the message
+                            var rejected_message = self.messages.orderedRemove(i);
+                            try rejected_message.addDeathEvent(self.name, .delivery_limit, rejected_message.exchange, &[_][]const u8{rejected_message.routing_key});
+
+                            if (dead_letter_fn) |dl_fn| {
+                                dl_fn(&rejected_message);
+                            } else {
+                                rejected_message.deinit();
+                            }
+
+                            self.messages_unacknowledged = @max(1, self.messages_unacknowledged) - 1;
+                            self.memory_usage -= rejected_message.body.len;
+                            std.log.debug("Message dead lettered due to delivery count in queue {s}: delivery_tag={}", .{ self.name, delivery_tag });
+                            return;
+                        }
+                    }
+
+                    self.messages_unacknowledged = @max(1, self.messages_unacknowledged) - 1;
+                    self.messages_ready += 1;
+                    std.log.debug("Message requeued in queue {s}: delivery_tag={}", .{ self.name, delivery_tag });
+                } else {
+                    // Dead letter the message if configured
+                    if (self.dead_letter_exchange != null) {
+                        var rejected_message = self.messages.orderedRemove(i);
+                        try rejected_message.addDeathEvent(self.name, .rejected, rejected_message.exchange, &[_][]const u8{rejected_message.routing_key});
+
+                        if (dead_letter_fn) |dl_fn| {
+                            dl_fn(&rejected_message);
+                        } else {
+                            rejected_message.deinit();
+                        }
+
+                        self.messages_unacknowledged = @max(1, self.messages_unacknowledged) - 1;
+                        self.memory_usage -= rejected_message.body.len;
+                        std.log.debug("Message dead lettered from queue {s}: delivery_tag={}", .{ self.name, delivery_tag });
+                    } else {
+                        // Drop the message
+                        var rejected_message = self.messages.orderedRemove(i);
+                        rejected_message.deinit();
+                        self.messages_unacknowledged = @max(1, self.messages_unacknowledged) - 1;
+                        self.memory_usage -= rejected_message.body.len;
+                        std.log.debug("Message rejected and dropped from queue {s}: delivery_tag={}", .{ self.name, delivery_tag });
+                    }
+                }
+                return;
+            }
+        }
+        return error.MessageNotFound;
+    }
+
+    /// Enhanced publish method with dead letter queue support
+    pub fn publishWithDeadLetter(self: *Queue, message: Message, dead_letter_fn: ?*const fn (message: *Message) void) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Check queue length limits and dead letter if necessary
+        if (self.max_length) |max_len| {
+            if (self.messages.items.len >= max_len) {
+                // Dead letter the oldest message if configured
+                if (self.dead_letter_exchange != null) {
+                    var oldest_message = self.messages.orderedRemove(0);
+                    try oldest_message.addDeathEvent(self.name, .maxlen, oldest_message.exchange, &[_][]const u8{oldest_message.routing_key});
+
+                    if (dead_letter_fn) |dl_fn| {
+                        dl_fn(&oldest_message);
+                    } else {
+                        oldest_message.deinit();
+                    }
+
+                    self.messages_ready = @max(1, self.messages_ready) - 1;
+                    self.memory_usage -= oldest_message.body.len;
+                    std.log.debug("Message dead lettered due to queue length limit in queue {s}", .{self.name});
+                } else {
+                    // Drop oldest message (head drop policy)
+                    var oldest_message = self.messages.orderedRemove(0);
+                    oldest_message.deinit();
+                    self.messages_ready = @max(1, self.messages_ready) - 1;
+                    self.memory_usage -= oldest_message.body.len;
+                    std.log.debug("Oldest message dropped due to queue length limit in queue {s}", .{self.name});
+                }
+            }
+        }
+
+        // Set max delivery count on message if configured
+        var new_message = message;
+        if (self.max_delivery_count) |max_count| {
+            new_message.max_delivery_count = max_count;
+        }
+
+        try self.messages.append(new_message);
+        self.messages_total += 1;
+        self.messages_ready += 1;
+        self.memory_usage += new_message.body.len;
+
+        std.log.debug("Message published to queue {s}: {} bytes", .{ self.name, new_message.body.len });
+
+        // Try to deliver to consumers
+        self.tryDeliverMessages();
+    }
+
+    /// Check if queue has dead letter exchange configured
+    pub fn hasDeadLetterExchange(self: *const Queue) bool {
+        return self.dead_letter_exchange != null;
+    }
+
+    /// Get dead letter exchange name
+    pub fn getDeadLetterExchange(self: *const Queue) ?[]const u8 {
+        return self.dead_letter_exchange;
+    }
+
+    /// Get dead letter routing key
+    pub fn getDeadLetterRoutingKey(self: *const Queue) ?[]const u8 {
+        return self.dead_letter_routing_key;
     }
 };
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const Exchange = @import("../routing/exchange.zig").Exchange;
 const ExchangeType = @import("../routing/exchange.zig").ExchangeType;
 const Queue = @import("../routing/queue.zig").Queue;
+const Message = @import("../message.zig").Message;
 
 pub const VirtualHost = struct {
     name: []const u8,
@@ -265,6 +266,83 @@ pub const VirtualHost = struct {
     }
 
     // Statistics and monitoring
+    /// Route a message to its destination queues using the specified exchange
+    pub fn routeMessage(self: *VirtualHost, exchange_name: []const u8, message: *Message) !void {
+        // Get the exchange
+        const exchange = self.exchanges.get(exchange_name) orelse return error.ExchangeNotFound;
+
+        // Route the message to get matching queues
+        const matched_queues = try exchange.routeMessage(message, self.allocator);
+        defer self.allocator.free(matched_queues);
+
+        // Publish to each matching queue
+        for (matched_queues) |queue_name| {
+            const queue = self.queues.get(queue_name) orelse continue;
+
+            // Use enhanced publish method with dead letter support
+            if (queue.hasDeadLetterExchange()) {
+                try queue.publishWithDeadLetter(message.*, &createDeadLetterCallback);
+            } else {
+                try queue.publish(message.*);
+            }
+        }
+    }
+
+    /// Enhanced dead letter callback that routes messages to dead letter exchanges
+    pub fn deadLetterCallback(self: *VirtualHost, message: *Message, source_queue_name: []const u8) void {
+        // Get the source queue to determine dead letter configuration
+        const source_queue = self.queues.get(source_queue_name) orelse {
+            std.log.err("Dead letter callback: source queue '{}' not found", .{source_queue_name});
+            message.deinit();
+            return;
+        };
+
+        // Get dead letter exchange configuration
+        const dl_exchange = source_queue.getDeadLetterExchange() orelse {
+            std.log.warn("Dead letter callback: no dead letter exchange configured for queue '{s}'", .{source_queue_name});
+            message.deinit();
+            return;
+        };
+
+        // Route the message to the dead letter exchange
+        const dl_routing_key = source_queue.getDeadLetterRoutingKey();
+        self.publishDeadLetterMessage(message, dl_exchange, dl_routing_key) catch |err| {
+            std.log.err("Failed to publish dead letter message: {}", .{err});
+            message.deinit();
+        };
+    }
+
+    /// Reject a message from a queue with dead letter support
+    pub fn rejectMessage(self: *VirtualHost, queue_name: []const u8, delivery_tag: u64, requeue: bool) !void {
+        const queue = self.queues.get(queue_name) orelse return error.QueueNotFound;
+
+        // Use enhanced reject method with dead letter support
+        if (queue.hasDeadLetterExchange()) {
+            try queue.rejectWithDeadLetter(delivery_tag, requeue, &createDeadLetterCallback);
+        } else {
+            try queue.reject(delivery_tag, requeue);
+        }
+    }
+
+    /// Create a dead letter callback function for this VirtualHost
+    fn createDeadLetterCallback(message: *Message) void {
+        // For now, we'll just log and clean up
+        // In a full implementation, we would need the VirtualHost context
+        std.log.info("Message {} dead lettered (callback)", .{message.id});
+        message.deinit();
+    }
+
+    /// Publish a message to a dead letter exchange
+    pub fn publishDeadLetterMessage(self: *VirtualHost, message: *Message, dead_letter_exchange: []const u8, dead_letter_routing_key: ?[]const u8) !void {
+        // Create dead letter message with updated routing
+        const dl_routing_key = dead_letter_routing_key orelse message.routing_key;
+        var dead_letter_message = try message.createDeadLetterMessage(self.allocator, dead_letter_exchange, dl_routing_key);
+        defer dead_letter_message.deinit();
+
+        // Route the dead letter message
+        try self.routeMessage(dead_letter_exchange, &dead_letter_message);
+    }
+
     pub fn getStats(self: *const VirtualHost, allocator: std.mem.Allocator) !std.json.Value {
         var stats = std.json.ObjectMap.init(allocator);
 
