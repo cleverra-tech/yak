@@ -227,6 +227,18 @@ pub const VirtualHost = struct {
         return @intCast(self.queues.count());
     }
 
+    pub fn listQueues(self: *VirtualHost, allocator: std.mem.Allocator) ![][]const u8 {
+        var queue_list = std.ArrayList([]const u8).init(allocator);
+        defer queue_list.deinit();
+
+        var iterator = self.queues.iterator();
+        while (iterator.next()) |entry| {
+            try queue_list.append(try allocator.dupe(u8, entry.key_ptr.*));
+        }
+
+        return queue_list.toOwnedSlice();
+    }
+
     pub fn purgeQueue(self: *VirtualHost, name: []const u8) !u32 {
         const queue = self.queues.get(name) orelse return error.QueueNotFound;
         const message_count = queue.purge();
@@ -295,4 +307,51 @@ test "virtual host creation and management" {
     const deleted_message_count = try vhost.deleteQueue("test-queue", false, false);
     try std.testing.expectEqual(@as(u32, 0), deleted_message_count);
     try std.testing.expectEqual(@as(u32, 0), vhost.getQueueCount());
+}
+
+test "vhost queue listing" {
+    const allocator = std.testing.allocator;
+
+    var vhost = try VirtualHost.init(allocator, "/");
+    defer vhost.deinit();
+
+    // Initially no queues
+    var queue_list = try vhost.listQueues(allocator);
+    defer {
+        for (queue_list) |name| {
+            allocator.free(name);
+        }
+        allocator.free(queue_list);
+    }
+    try std.testing.expectEqual(@as(usize, 0), queue_list.len);
+
+    // Create some queues
+    _ = try vhost.declareQueue("queue1", true, false, false, null);
+    _ = try vhost.declareQueue("queue2", false, true, false, null);
+    _ = try vhost.declareQueue("queue3", true, false, true, null);
+
+    // List queues again
+    queue_list = try vhost.listQueues(allocator);
+    defer {
+        for (queue_list) |name| {
+            allocator.free(name);
+        }
+        allocator.free(queue_list);
+    }
+    try std.testing.expectEqual(@as(usize, 3), queue_list.len);
+
+    // Verify queue names are present (order might vary)
+    var found_queue1 = false;
+    var found_queue2 = false;
+    var found_queue3 = false;
+    
+    for (queue_list) |name| {
+        if (std.mem.eql(u8, name, "queue1")) found_queue1 = true;
+        if (std.mem.eql(u8, name, "queue2")) found_queue2 = true;
+        if (std.mem.eql(u8, name, "queue3")) found_queue3 = true;
+    }
+    
+    try std.testing.expect(found_queue1);
+    try std.testing.expect(found_queue2);
+    try std.testing.expect(found_queue3);
 }

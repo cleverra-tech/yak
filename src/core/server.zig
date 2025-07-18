@@ -368,8 +368,10 @@ pub const Server = struct {
 
             // Basic command handling
             if (std.mem.eql(u8, command, "help")) {
-                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  exit - Close connection\n";
+                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  list queues [vhost] - List all queues in virtual host (default: /)\n  exit - Close connection\n";
                 try connection.stream.writeAll(help_msg);
+            } else if (std.mem.startsWith(u8, command, "list queues")) {
+                try self.handleListQueuesCommand(connection, command);
             } else if (std.mem.eql(u8, command, "status")) {
                 const status_msg = try std.fmt.allocPrint(self.allocator, "Server Status:\n  Running: {}\n  Connections: {}\n  Virtual Hosts: {}\n  Shutdown Requested: {}\n", .{
                     self.running,
@@ -401,6 +403,67 @@ pub const Server = struct {
         };
 
         std.log.info("CLI client {} thread terminating", .{context.client_id});
+    }
+
+    fn handleListQueuesCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        // Parse command to extract virtual host name
+        var vhost_name: []const u8 = "/"; // Default virtual host
+        
+        // Split command by spaces to check for vhost parameter
+        var parts = std.mem.splitSequence(u8, command, " ");
+        _ = parts.next(); // "list"
+        _ = parts.next(); // "queues"
+        
+        if (parts.next()) |vhost_arg| {
+            vhost_name = std.mem.trim(u8, vhost_arg, " \t\n\r");
+        }
+        
+        // Get the virtual host
+        const vhost = self.getVirtualHost(vhost_name);
+        if (vhost == null) {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error: Virtual host '{s}' not found\n", .{vhost_name});
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        }
+        
+        // Get list of queues
+        const queue_names = vhost.?.listQueues(self.allocator) catch |err| {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error listing queues: {}\n", .{err});
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+        defer {
+            for (queue_names) |name| {
+                self.allocator.free(name);
+            }
+            self.allocator.free(queue_names);
+        }
+        
+        // Format and send response
+        if (queue_names.len == 0) {
+            const no_queues_msg = try std.fmt.allocPrint(self.allocator, "No queues found in virtual host '{s}'\n", .{vhost_name});
+            defer self.allocator.free(no_queues_msg);
+            try connection.stream.writeAll(no_queues_msg);
+        } else {
+            const header_msg = try std.fmt.allocPrint(self.allocator, "Queues in virtual host '{s}':\n", .{vhost_name});
+            defer self.allocator.free(header_msg);
+            try connection.stream.writeAll(header_msg);
+            
+            for (queue_names) |queue_name| {
+                // Get queue details for additional info
+                const queue = vhost.?.getQueue(queue_name).?;
+                const queue_info = try std.fmt.allocPrint(self.allocator, "  {s} (messages: {}, consumers: {}, durable: {})\n", .{
+                    queue_name,
+                    queue.getMessageCount(),
+                    queue.getConsumerCount(),
+                    queue.durable,
+                });
+                defer self.allocator.free(queue_info);
+                try connection.stream.writeAll(queue_info);
+            }
+        }
     }
 
     fn handleConnectionWithRecovery(self: *Server, client_socket: std.net.Server.Connection) void {
