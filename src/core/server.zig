@@ -10,6 +10,13 @@ const ErrorHandler = @import("../error/error_handler.zig").ErrorHandler;
 const ErrorHelpers = @import("../error/error_handler.zig").ErrorHelpers;
 const RecoveryAction = @import("../error/error_handler.zig").RecoveryAction;
 
+// Context structure for CLI client thread
+const CliClientContext = struct {
+    server: *Server,
+    connection: std.net.Server.Connection,
+    client_id: u64,
+};
+
 // Global reference to server instance for persistence callback
 var global_server: ?*Server = null;
 
@@ -32,6 +39,7 @@ pub const Server = struct {
     vhosts: std.HashMap([]const u8, *VirtualHost, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     connections: std.ArrayList(*NetworkConnection),
     next_connection_id: u64,
+    next_cli_client_id: std.atomic.Value(u64),
     running: bool,
     tcp_server: ?std.net.Server,
     cli_server: ?std.net.Server,
@@ -50,6 +58,7 @@ pub const Server = struct {
             .vhosts = std.HashMap([]const u8, *VirtualHost, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .connections = std.ArrayList(*NetworkConnection).init(allocator),
             .next_connection_id = 1,
+            .next_cli_client_id = std.atomic.Value(u64).init(1),
             .running = false,
             .tcp_server = null,
             .cli_server = null,
@@ -283,11 +292,34 @@ pub const Server = struct {
             };
 
             if (client_connection) |connection| {
-                // Handle CLI client connection
-                self.handleCliConnection(connection) catch |err| {
-                    std.log.warn("Failed to handle CLI connection: {}", .{err});
+                // Spawn a separate thread to handle each CLI client connection
+                const client_id = self.next_cli_client_id.fetchAdd(1, .monotonic);
+
+                // Allocate context for the client thread
+                const context = self.allocator.create(CliClientContext) catch |err| {
+                    std.log.err("Failed to allocate memory for CLI client context: {}", .{err});
                     connection.stream.close();
+                    continue;
                 };
+
+                context.* = CliClientContext{
+                    .server = self,
+                    .connection = connection,
+                    .client_id = client_id,
+                };
+
+                // Spawn thread to handle this client
+                const thread = std.Thread.spawn(.{}, handleCliClientThread, .{context}) catch |err| {
+                    std.log.err("Failed to spawn CLI client thread: {}", .{err});
+                    self.allocator.destroy(context);
+                    connection.stream.close();
+                    continue;
+                };
+
+                // Detach the thread so it can clean up itself
+                thread.detach();
+
+                std.log.debug("Spawned CLI client thread for client {}", .{client_id});
             }
         }
 
@@ -319,9 +351,7 @@ pub const Server = struct {
     }
 
     fn handleCliConnection(self: *Server, connection: std.net.Server.Connection) !void {
-        defer connection.stream.close();
-
-        std.log.info("CLI client connected", .{});
+        std.log.debug("Processing CLI client connection", .{});
 
         // For now, send a simple welcome message and close
         // This will be expanded with actual CLI protocol handling
@@ -357,8 +387,20 @@ pub const Server = struct {
                 try connection.stream.writeAll(error_msg);
             }
         }
+    }
 
-        std.log.info("CLI client disconnected", .{});
+    fn handleCliClientThread(context: *CliClientContext) void {
+        defer context.server.allocator.destroy(context);
+        defer context.connection.stream.close();
+
+        std.log.info("CLI client {} connected on dedicated thread", .{context.client_id});
+
+        // Handle the CLI client connection
+        context.server.handleCliConnection(context.connection) catch |err| {
+            std.log.warn("CLI client {} error: {}", .{ context.client_id, err });
+        };
+
+        std.log.info("CLI client {} thread terminating", .{context.client_id});
     }
 
     fn handleConnectionWithRecovery(self: *Server, client_socket: std.net.Server.Connection) void {
