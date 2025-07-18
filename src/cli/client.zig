@@ -44,9 +44,92 @@ const CliClient = struct {
     }
 
     pub fn runInteractive(self: *CliClient) !void {
-        // TODO: Implement interactive mode with proper stdin handling
+        std.debug.print("Yak CLI Interactive Mode\n", .{});
+        std.debug.print("Type 'help' for available commands, 'exit' to quit.\n\n", .{});
+
+        while (true) {
+            std.debug.print("yak> ", .{});
+
+            // Read command from stdin
+            var input_buffer: [1024]u8 = undefined;
+            const stdin_file = std.fs.File{ .handle = 0 };
+            const bytes_read = try stdin_file.read(&input_buffer);
+
+            if (bytes_read == 0) {
+                // EOF reached (Ctrl+D)
+                std.debug.print("\nGoodbye!\n", .{});
+                break;
+            }
+
+            const input = input_buffer[0..bytes_read];
+            const command = std.mem.trim(u8, input, " \t\n\r");
+
+            // Handle empty commands
+            if (command.len == 0) continue;
+
+            // Handle exit command
+            if (std.mem.eql(u8, command, "exit") or std.mem.eql(u8, command, "quit")) {
+                std.debug.print("Goodbye!\n", .{});
+                break;
+            }
+
+            // Handle local help command
+            if (std.mem.eql(u8, command, "help")) {
+                self.printInteractiveHelp();
+                continue;
+            }
+
+            // Send command to server
+            const response = self.sendCommand(command) catch |err| {
+                std.debug.print("Error sending command: {}\n", .{err});
+                continue;
+            };
+            defer self.allocator.free(response);
+
+            // Print response
+            const clean_response = std.mem.trim(u8, response, " \t\n\r");
+            if (clean_response.len > 0) {
+                std.debug.print("{s}\n", .{clean_response});
+            }
+        }
+    }
+
+    fn printInteractiveHelp(self: *CliClient) void {
         _ = self;
-        std.debug.print("Interactive mode not yet implemented\n", .{});
+        const help_text =
+            \\Available commands:
+            \\
+            \\  Server Information:
+            \\    status                  Show broker status
+            \\    help                    Show server help
+            \\    
+            \\  Queue Management:
+            \\    list queues [vhost]     List all queues
+            \\    queue info <name>       Show queue details
+            \\    queue declare <name>    Create a new queue
+            \\    queue delete <name>     Delete a queue
+            \\    queue purge <name>      Remove all messages from queue
+            \\    
+            \\  Exchange Management:
+            \\    list exchanges [vhost]  List all exchanges
+            \\    exchange declare <name> <type>  Create exchange
+            \\    exchange delete <name>  Delete exchange
+            \\    
+            \\  Connection Management:
+            \\    list connections        List active connections
+            \\    
+            \\  Virtual Host Management:
+            \\    list vhosts             List all virtual hosts
+            \\    vhost info <name>       Show virtual host details
+            \\    vhost create <name>     Create virtual host
+            \\    vhost delete <name>     Delete virtual host
+            \\
+            \\  Interactive Commands:
+            \\    help                    Show this help
+            \\    exit, quit              Exit interactive mode
+            \\
+        ;
+        std.debug.print("{s}", .{help_text});
     }
 };
 
