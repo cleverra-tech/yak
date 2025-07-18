@@ -3,6 +3,18 @@ const Config = @import("../config.zig").Config;
 const VirtualHost = @import("vhost.zig").VirtualHost;
 const NetworkConnection = @import("../network/connection.zig").Connection;
 const ProtocolHandler = @import("../network/protocol.zig").ProtocolHandler;
+const Message = @import("../message.zig").Message;
+const Queue = @import("../routing/queue.zig").Queue;
+const Exchange = @import("../routing/exchange.zig").Exchange;
+
+// Global reference to server instance for persistence callback
+var global_server: ?*Server = null;
+
+fn serverPersistMessage(vhost_name: []const u8, queue_name: []const u8, message: *const Message) !void {
+    if (global_server) |server| {
+        try server.persistMessage(vhost_name, queue_name, message);
+    }
+}
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -14,6 +26,7 @@ pub const Server = struct {
     tcp_server: ?std.net.Server,
     cli_server: ?std.net.Server,
     protocol_handler: ProtocolHandler,
+    persistence_mutex: std.Thread.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Server {
         const protocol_handler = ProtocolHandler.init(allocator);
@@ -28,10 +41,22 @@ pub const Server = struct {
             .tcp_server = null,
             .cli_server = null,
             .protocol_handler = protocol_handler,
+            .persistence_mutex = std.Thread.Mutex{},
         };
+
+        // Set up global server reference for persistence callback
+        global_server = &server;
+        
+        // Set up persistence callback in protocol handler
+        server.protocol_handler.persist_message_fn = serverPersistMessage;
 
         // Create default virtual host
         try server.createVirtualHost("/");
+
+        // Recover persistent state from storage
+        server.recoverPersistentState() catch |err| {
+            std.log.warn("Failed to recover persistent state: {}", .{err});
+        };
 
         // Note: Virtual host integration will be handled within the protocol handler
         // using the connection's setVirtualHost method
@@ -40,6 +65,9 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        // Clear global reference
+        global_server = null;
+        
         self.stop();
 
         // Clean up protocol handler
@@ -227,6 +255,213 @@ pub const Server = struct {
         try stats.put("running", std.json.Value{ .bool = self.running });
 
         return std.json.Value{ .object = stats };
+    }
+
+    fn recoverPersistentState(self: *Server) !void {
+        const persistence_dir = "./yak_persistence";
+        
+        // Ensure persistence directory exists
+        std.fs.cwd().makeDir(persistence_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        // Recover virtual hosts and their durable resources
+        var vhost_iterator = self.vhosts.iterator();
+        while (vhost_iterator.next()) |entry| {
+            try self.recoverVirtualHost(entry.value_ptr.*, persistence_dir);
+        }
+
+        std.log.info("Persistent state recovery completed", .{});
+    }
+
+    fn recoverVirtualHost(self: *Server, vhost: *VirtualHost, persistence_dir: []const u8) !void {
+        
+        const vhost_dir = try std.fmt.allocPrint(self.allocator, "{s}/vhost_{s}", .{ persistence_dir, vhost.name });
+        defer self.allocator.free(vhost_dir);
+
+        // Try to open vhost directory
+        var dir = std.fs.cwd().openDir(vhost_dir, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                std.log.debug("No persistent data found for vhost {s}", .{vhost.name});
+                return;
+            },
+            else => return err,
+        };
+        defer dir.close();
+
+        // Recover durable queues and their messages
+        var queue_iterator = vhost.queues.iterator();
+        while (queue_iterator.next()) |entry| {
+            const queue = entry.value_ptr.*;
+            if (queue.durable) {
+                try self.recoverQueue(queue, dir);
+            }
+        }
+    }
+
+    fn recoverQueue(self: *Server, queue: *Queue, vhost_dir: std.fs.Dir) !void {
+        const queue_file = try std.fmt.allocPrint(self.allocator, "queue_{s}.dat", .{queue.name});
+        defer self.allocator.free(queue_file);
+
+        const file = vhost_dir.openFile(queue_file, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                std.log.debug("No persistent messages found for queue {s}", .{queue.name});
+                return;
+            },
+            else => return err,
+        };
+        defer file.close();
+
+        const file_size = try file.getEndPos();
+        if (file_size == 0) return;
+
+        const file_data = try self.allocator.alloc(u8, file_size);
+        defer self.allocator.free(file_data);
+
+        _ = try file.readAll(file_data);
+
+        // Parse message count from file header
+        if (file_data.len < 4) return;
+        const message_count = std.mem.readInt(u32, file_data[0..4], .little);
+        
+        var offset: usize = 4;
+        var recovered_count: u32 = 0;
+
+        for (0..message_count) |_| {
+            if (offset >= file_data.len) break;
+            
+            // Read message size
+            if (offset + 4 > file_data.len) break;
+            const message_size = std.mem.readInt(u32, file_data[offset..offset + 4][0..4], .little);
+            offset += 4;
+
+            if (offset + message_size > file_data.len) break;
+            
+            // Deserialize message
+            const message_data = file_data[offset..offset + message_size];
+            var message = Message.decodeFromStorage(message_data, self.allocator) catch |err| {
+                std.log.warn("Failed to decode persistent message: {}", .{err});
+                offset += message_size;
+                continue;
+            };
+
+            // Add message to queue
+            queue.publish(message) catch |err| {
+                std.log.warn("Failed to restore message to queue {s}: {}", .{ queue.name, err });
+                message.deinit();
+            };
+            
+            recovered_count += 1;
+            offset += message_size;
+        }
+
+        std.log.info("Recovered {} persistent messages for queue {s}", .{ recovered_count, queue.name });
+    }
+
+    pub fn persistMessage(self: *Server, vhost_name: []const u8, queue_name: []const u8, message: *const Message) !void {
+        if (!message.persistent) return;
+
+        self.persistence_mutex.lock();
+        defer self.persistence_mutex.unlock();
+
+        const persistence_dir = "./yak_persistence";
+        const vhost_dir_path = try std.fmt.allocPrint(self.allocator, "{s}/vhost_{s}", .{ persistence_dir, vhost_name });
+        defer self.allocator.free(vhost_dir_path);
+
+        // Ensure vhost directory exists
+        std.fs.cwd().makeDir(vhost_dir_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        const queue_file_path = try std.fmt.allocPrint(self.allocator, "{s}/queue_{s}.dat", .{ vhost_dir_path, queue_name });
+        defer self.allocator.free(queue_file_path);
+
+        // Serialize and append message to queue file
+        const encoded_message = try message.encodeForStorage(self.allocator);
+        defer self.allocator.free(encoded_message);
+
+        const file = try std.fs.cwd().createFile(queue_file_path, .{ .truncate = false });
+        defer file.close();
+
+        // Check if file is new (needs header)
+        const file_size = try file.getEndPos();
+        if (file_size == 0) {
+            // Write initial message count (0, will be updated later)
+            var buffer: [4]u8 = undefined;
+            std.mem.writeInt(u32, &buffer, 0, .little);
+            try file.writeAll(&buffer);
+        }
+
+        // Seek to end and append message
+        try file.seekTo(file_size);
+        var buffer: [4]u8 = undefined;
+        std.mem.writeInt(u32, &buffer, @intCast(encoded_message.len), .little);
+        try file.writeAll(&buffer);
+        try file.writeAll(encoded_message);
+
+        // Update message count in header
+        try file.seekTo(0);
+        const current_count = if (file_size == 0) 1 else blk: {
+            var read_buffer: [4]u8 = undefined;
+            _ = try file.readAll(&read_buffer);
+            const count = std.mem.readInt(u32, &read_buffer, .little);
+            break :blk count + 1;
+        };
+        try file.seekTo(0);
+        std.mem.writeInt(u32, &buffer, current_count, .little);
+        try file.writeAll(&buffer);
+
+        std.log.debug("Persisted message {} to queue {s} in vhost {s}", .{ message.id, queue_name, vhost_name });
+    }
+
+    pub fn persistQueueState(self: *Server, vhost_name: []const u8, queue: *const Queue) !void {
+        if (!queue.durable) return;
+
+        self.persistence_mutex.lock();
+        defer self.persistence_mutex.unlock();
+
+        const persistence_dir = "./yak_persistence";
+        const vhost_dir_path = try std.fmt.allocPrint(self.allocator, "{s}/vhost_{s}", .{ persistence_dir, vhost_name });
+        defer self.allocator.free(vhost_dir_path);
+
+        // Ensure vhost directory exists
+        std.fs.cwd().makeDir(vhost_dir_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        const queue_file_path = try std.fmt.allocPrint(self.allocator, "{s}/queue_{s}.dat", .{ vhost_dir_path, queue.name });
+        defer self.allocator.free(queue_file_path);
+
+        // Rewrite entire queue file with current persistent messages
+        const file = try std.fs.cwd().createFile(queue_file_path, .{ .truncate = true });
+        defer file.close();
+
+        var persistent_count: u32 = 0;
+        for (queue.messages.items) |message| {
+            if (message.persistent) persistent_count += 1;
+        }
+
+        // Write message count header
+        var buffer: [4]u8 = undefined;
+        std.mem.writeInt(u32, &buffer, persistent_count, .little);
+        try file.writeAll(&buffer);
+
+        // Write persistent messages
+        for (queue.messages.items) |message| {
+            if (message.persistent) {
+                const encoded = try message.encodeForStorage(self.allocator);
+                defer self.allocator.free(encoded);
+                
+                std.mem.writeInt(u32, &buffer, @intCast(encoded.len), .little);
+                try file.writeAll(&buffer);
+                try file.writeAll(encoded);
+            }
+        }
+
+        std.log.debug("Persisted {} messages for durable queue {s} in vhost {s}", .{ persistent_count, queue.name, vhost_name });
     }
 };
 

@@ -47,9 +47,10 @@ pub const ProtocolHandler = struct {
     allocator: std.mem.Allocator,
     server_properties: std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     get_vhost_fn: ?*const fn (vhost_name: []const u8) ?*VirtualHost,
+    persist_message_fn: ?*const fn (vhost_name: []const u8, queue_name: []const u8, message: *const Message) anyerror!void,
     pending_messages: std.HashMap(u64, PendingMessage, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage), // channel_id -> PendingMessage
     next_message_id: std.atomic.Value(u64),
-    
+
     // Thread safety mutexes
     pending_messages_mutex: std.Thread.Mutex,
     server_properties_mutex: std.Thread.RwLock,
@@ -59,6 +60,7 @@ pub const ProtocolHandler = struct {
             .allocator = allocator,
             .server_properties = std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .get_vhost_fn = null,
+            .persist_message_fn = null,
             .pending_messages = std.HashMap(u64, PendingMessage, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage).init(allocator),
             .next_message_id = std.atomic.Value(u64).init(1),
             .pending_messages_mutex = std.Thread.Mutex{},
@@ -77,7 +79,7 @@ pub const ProtocolHandler = struct {
         // Clean up server properties with write lock
         self.server_properties_mutex.lock();
         defer self.server_properties_mutex.unlock();
-        
+
         var iterator = self.server_properties.iterator();
         while (iterator.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -88,7 +90,7 @@ pub const ProtocolHandler = struct {
         // Clean up pending messages with mutex
         self.pending_messages_mutex.lock();
         defer self.pending_messages_mutex.unlock();
-        
+
         var pending_iterator = self.pending_messages.iterator();
         while (pending_iterator.next()) |entry| {
             entry.value_ptr.*.deinit(self.allocator);
@@ -109,7 +111,7 @@ pub const ProtocolHandler = struct {
     fn initServerProperties(self: *ProtocolHandler) !void {
         self.server_properties_mutex.lock();
         defer self.server_properties_mutex.unlock();
-        
+
         try self.server_properties.put(try self.allocator.dupe(u8, "product"), try self.allocator.dupe(u8, "Yak AMQP Message Broker"));
         try self.server_properties.put(try self.allocator.dupe(u8, "version"), try self.allocator.dupe(u8, "0.1.0"));
         try self.server_properties.put(try self.allocator.dupe(u8, "platform"), try self.allocator.dupe(u8, "Zig"));
@@ -1352,7 +1354,7 @@ pub const ProtocolHandler = struct {
         // Remove any existing pending message for this channel
         self.pending_messages_mutex.lock();
         defer self.pending_messages_mutex.unlock();
-        
+
         if (self.pending_messages.fetchRemove(channel_key)) |existing| {
             var existing_msg = existing.value;
             existing_msg.deinit(self.allocator);
@@ -1582,10 +1584,10 @@ pub const ProtocolHandler = struct {
 
         // Get pending message for this channel
         const channel_key = (@as(u64, connection.id) << 16) | frame.channel_id;
-        
+
         self.pending_messages_mutex.lock();
         defer self.pending_messages_mutex.unlock();
-        
+
         var pending_message = self.pending_messages.getPtr(channel_key) orelse {
             std.log.warn("Content header frame without preceding Basic.Publish on channel {} connection {}", .{ frame.channel_id, connection.id });
             return error.UnexpectedContentHeader;
@@ -1626,10 +1628,10 @@ pub const ProtocolHandler = struct {
 
         // Get pending message for this channel
         const channel_key = (@as(u64, connection.id) << 16) | frame.channel_id;
-        
+
         self.pending_messages_mutex.lock();
         defer self.pending_messages_mutex.unlock();
-        
+
         var pending_message = self.pending_messages.getPtr(channel_key) orelse {
             std.log.warn("Content body frame without preceding Basic.Publish/Header on channel {} connection {}", .{ frame.channel_id, connection.id });
             return error.UnexpectedContentBody;
@@ -1681,7 +1683,7 @@ pub const ProtocolHandler = struct {
             return error.NoPendingMessage;
         };
         self.pending_messages_mutex.unlock();
-        
+
         var pending_message = pending_entry.value;
         defer pending_message.deinit(self.allocator);
 
@@ -1750,9 +1752,39 @@ pub const ProtocolHandler = struct {
         }
 
         // Route message through exchange
-        _ = try exchange.routeMessage(&message, self.allocator);
+        const matched_queues = try exchange.routeMessage(&message, self.allocator);
+        defer self.allocator.free(matched_queues);
 
-        std.log.debug("Message routed: exchange={s}, routing_key={s}, body_size={}, message_id={}, channel={}, connection={}", .{ pending_message.exchange_name, pending_message.routing_key, pending_message.body_data.items.len, message_id, channel_id, connection.id });
+        // Deliver message to all matched queues
+        for (matched_queues) |queue_name| {
+            const queue = vhost.getQueue(queue_name) orelse {
+                std.log.warn("Skipping delivery to non-existent queue '{s}'", .{queue_name});
+                continue;
+            };
+
+            // Clone message for queue delivery (each queue gets its own copy)
+            var queue_message = try message.clone(self.allocator);
+
+            // Deliver to queue
+            queue.publish(queue_message) catch |err| {
+                std.log.warn("Failed to deliver message to queue '{s}': {}", .{ queue_name, err });
+                queue_message.deinit();
+                continue;
+            };
+
+            // Persist message if it's persistent and queue is durable
+            if (queue_message.persistent and queue.durable) {
+                if (self.persist_message_fn) |persist_fn| {
+                    persist_fn(vhost.name, queue_name, &queue_message) catch |err| {
+                        std.log.warn("Failed to persist message to queue '{s}': {}", .{ queue_name, err });
+                    };
+                }
+            }
+
+            std.log.debug("Message delivered to queue '{s}': message_id={}, persistent={}, durable={}", .{ queue_name, message_id, queue_message.persistent, queue.durable });
+        }
+
+        std.log.debug("Message routing completed: exchange={s}, routing_key={s}, body_size={}, message_id={}, queues={}, channel={}, connection={}", .{ pending_message.exchange_name, pending_message.routing_key, pending_message.body_data.items.len, message_id, matched_queues.len, channel_id, connection.id });
     }
 
     fn encodeFieldTable(self: *ProtocolHandler, table: std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage)) ![]u8 {

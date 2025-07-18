@@ -99,7 +99,8 @@ pub const Message = struct {
     }
 
     pub fn decodeFromStorage(data: []const u8, allocator: std.mem.Allocator) !Message {
-        var reader = std.io.fixedBufferStream(data).reader();
+        var stream = std.io.fixedBufferStream(data);
+        var reader = stream.reader();
 
         const id = try reader.readInt(u64, .little);
         const timestamp = try reader.readInt(u64, .little);
