@@ -1,0 +1,22 @@
+.{
+    .name = .yak,
+    .version = "0.1.0",
+    .fingerprint = 0x2e768fbdfa0cc81,
+    .minimum_zig_version = "0.15.0-dev.1034+bd97b6618",
+    .dependencies = .{
+        .wombat = .{
+            .url = "git+https://github.com/cleverra-tech/wombat.git?ref=HEAD#d672f50e678b896ec047c6aeb50aa7ce552afe31",
+            .hash = "wombat-0.1.0-uQKVCroHCwAdtPojCRp0c0ZcvBJe3kwMdogZapOSI_-O",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+        "tests",
+        "benchmarks",
+        "README.md",
+        "LICENSE",
+    },
+}

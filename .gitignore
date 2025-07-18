@@ -1,0 +1,87 @@
+# Zig build artifacts
+.zig-cache/
+zig-cache/
+zig-out/
+*.a
+*.so
+*.dylib
+
+# Dependencies (managed by zig package manager)
+deps/
+
+# Yak message broker binaries
+yak
+yak-cli
+yak-benchmark
+
+# Test data directories
+test_data/
+wombat_data/
+wombat_bench_data/
+data/
+
+# Yak runtime directories
+queue_data/
+exchange_data/
+message_data/
+auth_data/
+cli_data/
+
+# Benchmark results
+benchmark_results/
+perf_results/
+
+# Temporary directories and files
+tmp/
+*.tmp
+*.log
+wombat_test
+
+# Yak-specific logs and runtime files
+yak.log
+yak-cli.log
+yak.pid
+yak-cli.sock
+*.amqp.log
+
+# Configuration files (keep templates)
+yak.json
+local.json
+development.json
+production.json
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Database files (for testing)
+*.sst
+*.wal
+*.manifest
+*.lsm
+*.vlog
+
+# Wombat storage engine artifacts
+wombat_test/
+
+# Test coverage and profiling
+coverage/
+*.gcov
+*.prof
+*.pprof
+
+# Core dumps
+core.*
+*.core

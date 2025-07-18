@@ -1,0 +1,3 @@
+[submodule "deps/wombat"]
+	path = deps/wombat
+	url = https://github.com/cleverra-tech/wombat.git
