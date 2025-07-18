@@ -239,6 +239,18 @@ pub const VirtualHost = struct {
         return queue_list.toOwnedSlice();
     }
 
+    pub fn listExchanges(self: *VirtualHost, allocator: std.mem.Allocator) ![][]const u8 {
+        var exchange_list = std.ArrayList([]const u8).init(allocator);
+        defer exchange_list.deinit();
+
+        var iterator = self.exchanges.iterator();
+        while (iterator.next()) |entry| {
+            try exchange_list.append(try allocator.dupe(u8, entry.key_ptr.*));
+        }
+
+        return exchange_list.toOwnedSlice();
+    }
+
     pub fn purgeQueue(self: *VirtualHost, name: []const u8) !u32 {
         const queue = self.queues.get(name) orelse return error.QueueNotFound;
         const message_count = queue.purge();
@@ -354,4 +366,53 @@ test "vhost queue listing" {
     try std.testing.expect(found_queue1);
     try std.testing.expect(found_queue2);
     try std.testing.expect(found_queue3);
+}
+
+test "vhost exchange listing" {
+    const allocator = std.testing.allocator;
+
+    var vhost = try VirtualHost.init(allocator, "/");
+    defer vhost.deinit();
+
+    // List default exchanges
+    var exchange_list = try vhost.listExchanges(allocator);
+    defer {
+        for (exchange_list) |name| {
+            allocator.free(name);
+        }
+        allocator.free(exchange_list);
+    }
+    // Should have default exchanges (at least 5: "", amq.direct, amq.fanout, amq.topic, amq.headers)
+    try std.testing.expect(exchange_list.len >= 5);
+
+    // Create some custom exchanges
+    try vhost.declareExchange("custom1", ExchangeType.direct, true, false, false, null);
+    try vhost.declareExchange("custom2", ExchangeType.fanout, false, true, false, null);
+    try vhost.declareExchange("custom3", ExchangeType.topic, true, false, false, null);
+
+    // List exchanges again
+    exchange_list = try vhost.listExchanges(allocator);
+    defer {
+        for (exchange_list) |name| {
+            allocator.free(name);
+        }
+        allocator.free(exchange_list);
+    }
+    // Should have 3 more exchanges
+    try std.testing.expect(exchange_list.len >= 8);
+
+    // Verify custom exchange names are present
+    var found_custom1 = false;
+    var found_custom2 = false;
+    var found_custom3 = false;
+
+    for (exchange_list) |name| {
+        if (std.mem.eql(u8, name, "custom1")) found_custom1 = true;
+        if (std.mem.eql(u8, name, "custom2")) found_custom2 = true;
+        if (std.mem.eql(u8, name, "custom3")) found_custom3 = true;
+    }
+
+    try std.testing.expect(found_custom1);
+    try std.testing.expect(found_custom2);
+    try std.testing.expect(found_custom3);
 }

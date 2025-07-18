@@ -368,7 +368,7 @@ pub const Server = struct {
 
             // Basic command handling
             if (std.mem.eql(u8, command, "help")) {
-                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  list queues [vhost] - List all queues in virtual host (default: /)\n  queue info <name> [vhost] - Show detailed information about a queue\n  queue declare <name> [--durable] [--exclusive] [--auto-delete] [vhost] - Create a new queue\n  queue delete <name> [--if-unused] [--if-empty] [vhost] - Delete a queue\n  queue purge <name> [vhost] - Remove all messages from a queue\n  exit - Close connection\n";
+                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  list queues [vhost] - List all queues in virtual host (default: /)\n  list exchanges [vhost] - List all exchanges in virtual host (default: /)\n  queue info <name> [vhost] - Show detailed information about a queue\n  queue declare <name> [--durable] [--exclusive] [--auto-delete] [vhost] - Create a new queue\n  queue delete <name> [--if-unused] [--if-empty] [vhost] - Delete a queue\n  queue purge <name> [vhost] - Remove all messages from a queue\n  exchange declare <name> <type> [--durable] [--auto-delete] [vhost] - Create a new exchange\n  exchange delete <name> [--if-unused] [vhost] - Delete an exchange\n  exit - Close connection\n";
                 try connection.stream.writeAll(help_msg);
             } else if (std.mem.startsWith(u8, command, "list queues")) {
                 try self.handleListQueuesCommand(connection, command);
@@ -380,6 +380,12 @@ pub const Server = struct {
                 try self.handleQueueDeleteCommand(connection, command);
             } else if (std.mem.startsWith(u8, command, "queue purge")) {
                 try self.handleQueuePurgeCommand(connection, command);
+            } else if (std.mem.startsWith(u8, command, "exchange declare")) {
+                try self.handleExchangeDeclareCommand(connection, command);
+            } else if (std.mem.startsWith(u8, command, "exchange delete")) {
+                try self.handleExchangeDeleteCommand(connection, command);
+            } else if (std.mem.startsWith(u8, command, "list exchanges")) {
+                try self.handleListExchangesCommand(connection, command);
             } else if (std.mem.eql(u8, command, "status")) {
                 const status_msg = try std.fmt.allocPrint(self.allocator, "Server Status:\n  Running: {}\n  Connections: {}\n  Virtual Hosts: {}\n  Shutdown Requested: {}\n", .{
                     self.running,
@@ -742,6 +748,219 @@ pub const Server = struct {
             queue_name,
             vhost_name,
             message_count,
+        });
+        defer self.allocator.free(success_msg);
+        try connection.stream.writeAll(success_msg);
+    }
+
+    fn handleListExchangesCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        // Parse command to extract virtual host name
+        var vhost_name: []const u8 = "/"; // Default virtual host
+
+        // Split command by spaces to check for vhost parameter
+        var parts = std.mem.splitSequence(u8, command, " ");
+        _ = parts.next(); // "list"
+        _ = parts.next(); // "exchanges"
+
+        if (parts.next()) |vhost_arg| {
+            vhost_name = std.mem.trim(u8, vhost_arg, " \t\n\r");
+        }
+
+        // Get the virtual host
+        const vhost = self.getVirtualHost(vhost_name);
+        if (vhost == null) {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error: Virtual host '{s}' not found\n", .{vhost_name});
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        }
+
+        // Get list of exchanges
+        const exchange_names = vhost.?.listExchanges(self.allocator) catch |err| {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error listing exchanges: {}\n", .{err});
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+        defer {
+            for (exchange_names) |name| {
+                self.allocator.free(name);
+            }
+            self.allocator.free(exchange_names);
+        }
+
+        // Format and send response
+        if (exchange_names.len == 0) {
+            const no_exchanges_msg = try std.fmt.allocPrint(self.allocator, "No exchanges found in virtual host '{s}'\n", .{vhost_name});
+            defer self.allocator.free(no_exchanges_msg);
+            try connection.stream.writeAll(no_exchanges_msg);
+        } else {
+            const header_msg = try std.fmt.allocPrint(self.allocator, "Exchanges in virtual host '{s}':\n", .{vhost_name});
+            defer self.allocator.free(header_msg);
+            try connection.stream.writeAll(header_msg);
+
+            for (exchange_names) |exchange_name| {
+                // Get exchange details for additional info
+                const exchange = vhost.?.getExchange(exchange_name).?;
+                const exchange_info = try std.fmt.allocPrint(self.allocator, "  {s} (type: {s}, durable: {}, bindings: {})\n", .{
+                    exchange_name,
+                    @tagName(exchange.exchange_type),
+                    exchange.durable,
+                    exchange.bindings.items.len,
+                });
+                defer self.allocator.free(exchange_info);
+                try connection.stream.writeAll(exchange_info);
+            }
+        }
+    }
+
+    fn handleExchangeDeclareCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        // Parse command to extract exchange name, type, flags, and optional virtual host name
+        var parts = std.mem.splitSequence(u8, command, " ");
+        _ = parts.next(); // "exchange"
+        _ = parts.next(); // "declare"
+
+        const exchange_name = parts.next() orelse {
+            const error_msg = "Error: Exchange name is required. Usage: exchange declare <name> <type> [--durable] [--auto-delete] [vhost]\n";
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        const exchange_type_str = parts.next() orelse {
+            const error_msg = "Error: Exchange type is required. Valid types: direct, fanout, topic, headers\n";
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        // Parse exchange type
+        const exchange_type = if (std.mem.eql(u8, exchange_type_str, "direct"))
+            @import("../routing/exchange.zig").ExchangeType.direct
+        else if (std.mem.eql(u8, exchange_type_str, "fanout"))
+            @import("../routing/exchange.zig").ExchangeType.fanout
+        else if (std.mem.eql(u8, exchange_type_str, "topic"))
+            @import("../routing/exchange.zig").ExchangeType.topic
+        else if (std.mem.eql(u8, exchange_type_str, "headers"))
+            @import("../routing/exchange.zig").ExchangeType.headers
+        else {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error: Invalid exchange type '{s}'. Valid types: direct, fanout, topic, headers\n", .{exchange_type_str});
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        // Parse optional flags and virtual host
+        var durable = false;
+        var auto_delete = false;
+        var vhost_name: []const u8 = "/"; // Default virtual host
+
+        while (parts.next()) |part| {
+            const trimmed_part = std.mem.trim(u8, part, " \t\n\r");
+            if (std.mem.eql(u8, trimmed_part, "--durable")) {
+                durable = true;
+            } else if (std.mem.eql(u8, trimmed_part, "--auto-delete")) {
+                auto_delete = true;
+            } else if (!std.mem.startsWith(u8, trimmed_part, "--")) {
+                // Assume it's a virtual host name if it doesn't start with --
+                vhost_name = trimmed_part;
+            }
+        }
+
+        // Get the virtual host
+        const vhost = self.getVirtualHost(vhost_name);
+        if (vhost == null) {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error: Virtual host '{s}' not found\n", .{vhost_name});
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        }
+
+        // Declare the exchange
+        vhost.?.declareExchange(exchange_name, exchange_type, durable, auto_delete, false, null) catch |err| {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error creating exchange '{s}': {}\n", .{ exchange_name, err });
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        // Send success response
+        const success_msg = try std.fmt.allocPrint(self.allocator,
+            \\Exchange declared successfully: {s}
+            \\  Virtual Host: {s}
+            \\  Type: {s}
+            \\  Durable: {}
+            \\  Auto Delete: {}
+            \\
+        , .{
+            exchange_name,
+            vhost_name,
+            @tagName(exchange_type),
+            durable,
+            auto_delete,
+        });
+        defer self.allocator.free(success_msg);
+        try connection.stream.writeAll(success_msg);
+    }
+
+    fn handleExchangeDeleteCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        // Parse command to extract exchange name, flags, and optional virtual host name
+        var parts = std.mem.splitSequence(u8, command, " ");
+        _ = parts.next(); // "exchange"
+        _ = parts.next(); // "delete"
+
+        const exchange_name = parts.next() orelse {
+            const error_msg = "Error: Exchange name is required. Usage: exchange delete <name> [--if-unused] [vhost]\n";
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        // Parse optional flags and virtual host
+        var if_unused = false;
+        var vhost_name: []const u8 = "/"; // Default virtual host
+
+        while (parts.next()) |part| {
+            const trimmed_part = std.mem.trim(u8, part, " \t\n\r");
+            if (std.mem.eql(u8, trimmed_part, "--if-unused")) {
+                if_unused = true;
+            } else if (!std.mem.startsWith(u8, trimmed_part, "--")) {
+                // Assume it's a virtual host name if it doesn't start with --
+                vhost_name = trimmed_part;
+            }
+        }
+
+        // Get the virtual host
+        const vhost = self.getVirtualHost(vhost_name);
+        if (vhost == null) {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error: Virtual host '{s}' not found\n", .{vhost_name});
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        }
+
+        // Check if exchange exists before attempting deletion
+        const exchange = vhost.?.getExchange(exchange_name);
+        if (exchange == null) {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error: Exchange '{s}' not found in virtual host '{s}'\n", .{ exchange_name, vhost_name });
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        }
+
+        // Delete the exchange
+        vhost.?.deleteExchange(exchange_name, if_unused) catch |err| {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error deleting exchange '{s}': {}\n", .{ exchange_name, err });
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        // Send success response
+        const success_msg = try std.fmt.allocPrint(self.allocator,
+            \\Exchange deleted successfully: {s}
+            \\  Virtual Host: {s}
+            \\
+        , .{
+            exchange_name,
+            vhost_name,
         });
         defer self.allocator.free(success_msg);
         try connection.stream.writeAll(success_msg);
@@ -1244,4 +1463,49 @@ test "server queue purge command handling" {
     // Verify queue still exists after purge
     try std.testing.expect(vhost.getQueue("test-purge-queue") != null);
     try std.testing.expectEqual(@as(u32, 1), vhost.getQueueCount());
+}
+
+test "server exchange commands handling" {
+    const allocator = std.testing.allocator;
+
+    var config = try Config.default(allocator);
+    defer config.deinit(allocator);
+
+    var server = try Server.init(allocator, config);
+    defer server.deinit();
+
+    const vhost = server.getVirtualHost("/").?;
+
+    // Check that default exchanges exist (created during vhost init)
+    const initial_count = vhost.getExchangeCount();
+    try std.testing.expect(initial_count > 0);
+
+    // Test declaring a custom direct exchange
+    try vhost.declareExchange("test-direct", @import("../routing/exchange.zig").ExchangeType.direct, true, false, false, null);
+    try std.testing.expectEqual(initial_count + 1, vhost.getExchangeCount());
+
+    const exchange1 = vhost.getExchange("test-direct");
+    try std.testing.expect(exchange1 != null);
+    try std.testing.expectEqual(@import("../routing/exchange.zig").ExchangeType.direct, exchange1.?.exchange_type);
+    try std.testing.expectEqual(true, exchange1.?.durable);
+    try std.testing.expectEqual(false, exchange1.?.auto_delete);
+
+    // Test declaring a fanout exchange
+    try vhost.declareExchange("test-fanout", @import("../routing/exchange.zig").ExchangeType.fanout, false, true, false, null);
+    try std.testing.expectEqual(initial_count + 2, vhost.getExchangeCount());
+
+    const exchange2 = vhost.getExchange("test-fanout");
+    try std.testing.expect(exchange2 != null);
+    try std.testing.expectEqual(@import("../routing/exchange.zig").ExchangeType.fanout, exchange2.?.exchange_type);
+    try std.testing.expectEqual(false, exchange2.?.durable);
+    try std.testing.expectEqual(true, exchange2.?.auto_delete);
+
+    // Test deleting exchanges
+    try vhost.deleteExchange("test-direct", false);
+    try std.testing.expectEqual(initial_count + 1, vhost.getExchangeCount());
+    try std.testing.expect(vhost.getExchange("test-direct") == null);
+
+    try vhost.deleteExchange("test-fanout", false);
+    try std.testing.expectEqual(initial_count, vhost.getExchangeCount());
+    try std.testing.expect(vhost.getExchange("test-fanout") == null);
 }
