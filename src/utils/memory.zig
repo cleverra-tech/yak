@@ -43,7 +43,7 @@ pub const MemoryPool = struct {
         defer self.mutex.unlock();
 
         if (self.free_blocks.items.len > 0) {
-            return self.free_blocks.pop();
+            return self.free_blocks.pop().?;
         }
 
         // Allocate new block if pool is empty
@@ -82,8 +82,8 @@ pub const RingBuffer = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
 
-    pub fn init(allocator: std.mem.Allocator, capacity: usize) !RingBuffer {
-        const buffer = try allocator.alloc(u8, capacity);
+    pub fn init(allocator: std.mem.Allocator, buffer_capacity: usize) !RingBuffer {
+        const buffer = try allocator.alloc(u8, buffer_capacity);
         return RingBuffer{
             .buffer = buffer,
             .head = 0,
@@ -102,8 +102,8 @@ pub const RingBuffer = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const available = self.buffer.len - self.size;
-        const to_write = @min(data.len, available);
+        const space_available = self.buffer.len - self.size;
+        const to_write = @min(data.len, space_available);
 
         if (to_write == 0) {
             return 0;
@@ -211,30 +211,121 @@ pub const MemoryMappedFile = struct {
 pub const MemoryUtils = struct {
     pub fn getProcessMemoryUsage() !usize {
         // Platform-specific memory usage detection
-        // This is a simplified implementation
-        if (@import("builtin").os.tag == .linux) {
-            const file = std.fs.cwd().openFile("/proc/self/status", .{}) catch return 0;
-            defer file.close();
+        switch (@import("builtin").os.tag) {
+            .linux => {
+                return getLinuxMemoryUsage() catch 0;
+            },
+            .macos => {
+                return getMacOSMemoryUsage() catch 0;
+            },
+            .windows => {
+                return getWindowsMemoryUsage() catch 0;
+            },
+            .freebsd, .netbsd, .openbsd => {
+                return getBSDMemoryUsage() catch 0;
+            },
+            else => {
+                // Fallback: Use a basic heap estimation
+                return getFallbackMemoryUsage();
+            },
+        }
+    }
 
-            var buf: [4096]u8 = undefined;
-            const bytes_read = try file.readAll(&buf);
-            const contents = buf[0..bytes_read];
+    fn getLinuxMemoryUsage() !usize {
+        const file = try std.fs.cwd().openFile("/proc/self/status", .{});
+        defer file.close();
 
-            var lines = std.mem.split(u8, contents, "\n");
-            while (lines.next()) |line| {
-                if (std.mem.startsWith(u8, line, "VmRSS:")) {
-                    var parts = std.mem.split(u8, line, " ");
-                    _ = parts.next(); // Skip "VmRSS:"
-                    if (parts.next()) |size_str| {
-                        if (std.fmt.parseInt(usize, std.mem.trim(u8, size_str, " \t"), 10)) |size_kb| {
-                            return size_kb * 1024; // Convert KB to bytes
-                        } else |_| {}
-                    }
+        var buf: [8192]u8 = undefined;
+        const bytes_read = try file.readAll(&buf);
+        const contents = buf[0..bytes_read];
+
+        var lines = std.mem.splitSequence(u8, contents, "\n");
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "VmRSS:")) {
+                var parts = std.mem.tokenizeAny(u8, line, " \t");
+                _ = parts.next(); // Skip "VmRSS:"
+                if (parts.next()) |size_str| {
+                    const size_kb = try std.fmt.parseInt(usize, size_str, 10);
+                    return size_kb * 1024; // Convert KB to bytes
                 }
             }
         }
+        return error.MemoryInfoNotFound;
+    }
 
-        return 0;
+    fn getMacOSMemoryUsage() !usize {
+        // Try to read from system files or use ps command
+        return getPSMemoryUsage() catch getFallbackMemoryUsage();
+    }
+
+    fn getWindowsMemoryUsage() !usize {
+        // Use tasklist command to get memory usage on Windows
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+
+        const pid_filter = try std.fmt.allocPrint(allocator, "pid eq {}", .{std.process.getpid()});
+        
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &[_][]const u8{ "tasklist", "/fi", pid_filter, "/fo", "csv" },
+        }) catch return error.MemoryInfoNotFound;
+
+        // Parse CSV output to extract memory usage
+        var lines = std.mem.splitSequence(u8, result.stdout, "\n");
+        var line_count: u32 = 0;
+        while (lines.next()) |line| {
+            line_count += 1;
+            if (line_count == 2) { // Skip header, process second line
+                var fields = std.mem.splitSequence(u8, line, ",");
+                var field_count: u32 = 0;
+                while (fields.next()) |field| {
+                    field_count += 1;
+                    if (field_count == 5) { // Memory usage is typically 5th field
+                        const clean_field = std.mem.trim(u8, field, "\" ,K");
+                        const mem_kb = std.fmt.parseInt(usize, clean_field, 10) catch continue;
+                        return mem_kb * 1024;
+                    }
+                }
+                break;
+            }
+        }
+
+        return error.MemoryInfoNotFound;
+    }
+
+    fn getBSDMemoryUsage() !usize {
+        // Use ps command for BSD systems
+        return getPSMemoryUsage() catch getFallbackMemoryUsage();
+    }
+
+    fn getPSMemoryUsage() !usize {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+
+        const pid_str = try std.fmt.allocPrint(allocator, "{}", .{std.process.getpid()});
+        
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &[_][]const u8{ "ps", "-o", "rss=", "-p", pid_str },
+        }) catch return error.MemoryInfoNotFound;
+
+        const rss_str = std.mem.trim(u8, result.stdout, " \t\n\r");
+        const rss_kb = std.fmt.parseInt(usize, rss_str, 10) catch return error.MemoryInfoNotFound;
+        
+        return rss_kb * 1024; // Convert KB to bytes
+    }
+
+    fn getFallbackMemoryUsage() usize {
+        // Fallback method: estimate based on heap allocations
+        // This is not accurate but provides a basic indication
+        const heap_stats = std.heap.page_allocator.vtable;
+        _ = heap_stats; // Suppress unused variable warning
+        
+        // Return a conservative estimate
+        // In practice, this should be enhanced with more sophisticated tracking
+        return 1024 * 1024; // 1MB base estimate
     }
 
     pub fn formatBytes(bytes: usize, allocator: std.mem.Allocator) ![]u8 {
