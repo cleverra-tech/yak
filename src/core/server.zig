@@ -35,6 +35,7 @@ pub const Server = struct {
     running: bool,
     tcp_server: ?std.net.Server,
     cli_server: ?std.net.Server,
+    cli_thread: ?std.Thread,
     protocol_handler: ProtocolHandler,
     persistence_mutex: std.Thread.Mutex,
     error_handler: ErrorHandler,
@@ -52,6 +53,7 @@ pub const Server = struct {
             .running = false,
             .tcp_server = null,
             .cli_server = null,
+            .cli_thread = null,
             .protocol_handler = protocol_handler,
             .persistence_mutex = std.Thread.Mutex{},
             .error_handler = ErrorHandler.init(allocator),
@@ -91,6 +93,11 @@ pub const Server = struct {
         global_server = null;
 
         self.stop();
+
+        // Wait for CLI thread to finish if it's running
+        if (self.cli_thread) |thread| {
+            thread.join();
+        }
 
         // Clean up error handler
         self.error_handler.deinit();
@@ -133,7 +140,7 @@ pub const Server = struct {
 
                 switch (action) {
                     .shutdown_server => {
-                        std.log.err("Shutting down server due to connection accept failures");
+                        std.log.err("Shutting down server due to connection accept failures", .{});
                         self.requestShutdown();
                         break;
                     },
@@ -238,7 +245,120 @@ pub const Server = struct {
         const address = try std.net.Address.initUnix(self.config.cli.socket_path);
         self.cli_server = try address.listen(.{});
 
-        // TODO: Start CLI server in separate thread
+        // Start CLI server in separate thread
+        self.cli_thread = try std.Thread.spawn(.{}, cliServerThread, .{self});
+
+        std.log.info("CLI server thread started successfully", .{});
+    }
+
+    fn cliServerThread(self: *Server) void {
+        std.log.debug("CLI server thread started", .{});
+
+        if (self.cli_server == null) {
+            std.log.err("CLI server not initialized when starting thread", .{});
+            return;
+        }
+
+        // Main CLI server loop
+        while (self.running and !self.shutdown_requested.load(.monotonic)) {
+            // Accept CLI client connections with timeout to check shutdown status
+            const client_connection = self.acceptCliConnectionWithTimeout(100) catch |err| switch (err) {
+                error.WouldBlock => continue, // Timeout, check shutdown flag
+                else => {
+                    const error_info = ErrorHelpers.recoverableError(.resource_error, "Failed to accept CLI connection");
+                    const action = self.error_handler.handleError(error_info);
+
+                    switch (action) {
+                        .shutdown_server => {
+                            std.log.err("Shutting down CLI server due to persistent connection failures", .{});
+                            self.requestShutdown();
+                            break;
+                        },
+                        else => {
+                            std.Thread.sleep(100 * std.time.ns_per_ms);
+                            continue;
+                        },
+                    }
+                },
+            };
+
+            if (client_connection) |connection| {
+                // Handle CLI client connection
+                self.handleCliConnection(connection) catch |err| {
+                    std.log.warn("Failed to handle CLI connection: {}", .{err});
+                    connection.stream.close();
+                };
+            }
+        }
+
+        std.log.debug("CLI server thread shutting down", .{});
+    }
+
+    fn acceptCliConnectionWithTimeout(self: *Server, timeout_ms: u32) !?std.net.Server.Connection {
+        _ = timeout_ms;
+
+        if (self.cli_server == null) {
+            return error.ServerNotInitialized;
+        }
+
+        // Use poll to check if socket is ready with timeout
+        var pollfds = [_]std.posix.pollfd{
+            std.posix.pollfd{
+                .fd = self.cli_server.?.stream.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+
+        const poll_result = try std.posix.poll(&pollfds, 100); // 100ms timeout
+        if (poll_result == 0) {
+            return null; // Timeout
+        }
+
+        return try self.cli_server.?.accept();
+    }
+
+    fn handleCliConnection(self: *Server, connection: std.net.Server.Connection) !void {
+        defer connection.stream.close();
+
+        std.log.info("CLI client connected", .{});
+
+        // For now, send a simple welcome message and close
+        // This will be expanded with actual CLI protocol handling
+        const welcome_msg = "Welcome to Yak AMQP Broker CLI\nType 'help' for available commands\n> ";
+        try connection.stream.writeAll(welcome_msg);
+
+        // Read one command (basic implementation)
+        var buffer: [1024]u8 = undefined;
+        const bytes_read = try connection.stream.read(&buffer);
+
+        if (bytes_read > 0) {
+            const command = std.mem.trim(u8, buffer[0..bytes_read], " \n\r\t");
+            std.log.info("CLI command received: {s}", .{command});
+
+            // Basic command handling
+            if (std.mem.eql(u8, command, "help")) {
+                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  exit - Close connection\n";
+                try connection.stream.writeAll(help_msg);
+            } else if (std.mem.eql(u8, command, "status")) {
+                const status_msg = try std.fmt.allocPrint(self.allocator, "Server Status:\n  Running: {}\n  Connections: {}\n  Virtual Hosts: {}\n  Shutdown Requested: {}\n", .{
+                    self.running,
+                    self.getConnectionCount(),
+                    self.getVirtualHostCount(),
+                    self.isShutdownRequested(),
+                });
+                defer self.allocator.free(status_msg);
+                try connection.stream.writeAll(status_msg);
+            } else if (std.mem.eql(u8, command, "exit")) {
+                try connection.stream.writeAll("Goodbye!\n");
+            } else {
+                const error_msg = try std.fmt.allocPrint(self.allocator, "Unknown command: {s}\nType 'help' for available commands\n", .{command});
+                defer self.allocator.free(error_msg);
+                try connection.stream.writeAll(error_msg);
+            }
+        }
+
+        std.log.info("CLI client disconnected", .{});
     }
 
     fn handleConnectionWithRecovery(self: *Server, client_socket: std.net.Server.Connection) void {
