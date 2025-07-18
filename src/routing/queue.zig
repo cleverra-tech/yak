@@ -281,11 +281,10 @@ pub const Queue = struct {
         routing_key: []const u8,
         arguments: ?[]const u8,
     ) !void {
-        _ = arguments; // TODO: Use arguments for matching
-
         for (self.bindings.items, 0..) |binding, i| {
             if (std.mem.eql(u8, binding.exchange_name, exchange_name) and
-                std.mem.eql(u8, binding.routing_key, routing_key))
+                std.mem.eql(u8, binding.routing_key, routing_key) and
+                binding.argumentsMatch(arguments))
             {
                 var removed_binding = self.bindings.swapRemove(i);
                 removed_binding.deinit();
@@ -420,4 +419,35 @@ test "queue purge" {
     const purged_count = queue.purge();
     try std.testing.expectEqual(@as(u32, 5), purged_count);
     try std.testing.expectEqual(@as(u32, 0), queue.getMessageCount());
+}
+
+test "queue binding arguments matching" {
+    const allocator = std.testing.allocator;
+
+    var queue = try Queue.init(allocator, "test.queue", true, false, false, null);
+    defer queue.deinit();
+
+    // Add bindings with different arguments
+    try queue.addBinding("exchange1", "key1", null);
+    try queue.addBinding("exchange1", "key1", "args1");
+    try queue.addBinding("exchange1", "key1", "args2");
+
+    try std.testing.expectEqual(@as(usize, 3), queue.bindings.items.len);
+
+    // Remove binding with null arguments should only remove the null binding
+    try queue.removeBinding("exchange1", "key1", null);
+    try std.testing.expectEqual(@as(usize, 2), queue.bindings.items.len);
+
+    // Remove binding with specific arguments should only remove matching binding
+    try queue.removeBinding("exchange1", "key1", "args1");
+    try std.testing.expectEqual(@as(usize, 1), queue.bindings.items.len);
+
+    // Trying to remove with wrong arguments should fail
+    const result = queue.removeBinding("exchange1", "key1", "wrong_args");
+    try std.testing.expectError(error.BindingNotFound, result);
+    try std.testing.expectEqual(@as(usize, 1), queue.bindings.items.len);
+
+    // Remove with correct arguments should succeed
+    try queue.removeBinding("exchange1", "key1", "args2");
+    try std.testing.expectEqual(@as(usize, 0), queue.bindings.items.len);
 }
