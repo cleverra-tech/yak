@@ -368,7 +368,7 @@ pub const Server = struct {
 
             // Basic command handling
             if (std.mem.eql(u8, command, "help")) {
-                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  list queues [vhost] - List all queues in virtual host (default: /)\n  queue info <name> [vhost] - Show detailed information about a queue\n  queue declare <name> [--durable] [--exclusive] [--auto-delete] [vhost] - Create a new queue\n  queue delete <name> [--if-unused] [--if-empty] [vhost] - Delete a queue\n  exit - Close connection\n";
+                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  list queues [vhost] - List all queues in virtual host (default: /)\n  queue info <name> [vhost] - Show detailed information about a queue\n  queue declare <name> [--durable] [--exclusive] [--auto-delete] [vhost] - Create a new queue\n  queue delete <name> [--if-unused] [--if-empty] [vhost] - Delete a queue\n  queue purge <name> [vhost] - Remove all messages from a queue\n  exit - Close connection\n";
                 try connection.stream.writeAll(help_msg);
             } else if (std.mem.startsWith(u8, command, "list queues")) {
                 try self.handleListQueuesCommand(connection, command);
@@ -378,6 +378,8 @@ pub const Server = struct {
                 try self.handleQueueDeclareCommand(connection, command);
             } else if (std.mem.startsWith(u8, command, "queue delete")) {
                 try self.handleQueueDeleteCommand(connection, command);
+            } else if (std.mem.startsWith(u8, command, "queue purge")) {
+                try self.handleQueuePurgeCommand(connection, command);
             } else if (std.mem.eql(u8, command, "status")) {
                 const status_msg = try std.fmt.allocPrint(self.allocator, "Server Status:\n  Running: {}\n  Connections: {}\n  Virtual Hosts: {}\n  Shutdown Requested: {}\n", .{
                     self.running,
@@ -677,6 +679,64 @@ pub const Server = struct {
             \\Queue deleted successfully: {s}
             \\  Virtual Host: {s}
             \\  Messages deleted: {}
+            \\
+        , .{
+            queue_name,
+            vhost_name,
+            message_count,
+        });
+        defer self.allocator.free(success_msg);
+        try connection.stream.writeAll(success_msg);
+    }
+
+    fn handleQueuePurgeCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        // Parse command to extract queue name and optional virtual host name
+        var parts = std.mem.splitSequence(u8, command, " ");
+        _ = parts.next(); // "queue"
+        _ = parts.next(); // "purge"
+
+        const queue_name = parts.next() orelse {
+            const error_msg = "Error: Queue name is required. Usage: queue purge <name> [vhost]\n";
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        var vhost_name: []const u8 = "/"; // Default virtual host
+        if (parts.next()) |vhost_arg| {
+            vhost_name = std.mem.trim(u8, vhost_arg, " \t\n\r");
+        }
+
+        // Get the virtual host
+        const vhost = self.getVirtualHost(vhost_name);
+        if (vhost == null) {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error: Virtual host '{s}' not found\n", .{vhost_name});
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        }
+
+        // Check if queue exists before attempting purge
+        const queue = vhost.?.getQueue(queue_name);
+        if (queue == null) {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error: Queue '{s}' not found in virtual host '{s}'\n", .{ queue_name, vhost_name });
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        }
+
+        // Purge the queue
+        const message_count = vhost.?.purgeQueue(queue_name) catch |err| {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error purging queue '{s}': {}\n", .{ queue_name, err });
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        // Send success response
+        const success_msg = try std.fmt.allocPrint(self.allocator,
+            \\Queue purged successfully: {s}
+            \\  Virtual Host: {s}
+            \\  Messages purged: {}
             \\
         , .{
             queue_name,
@@ -1157,4 +1217,31 @@ test "server queue delete command handling" {
     try std.testing.expectEqual(@as(u32, 0), message_count3);
     try std.testing.expect(vhost.getQueue("test-delete-exclusive") == null);
     try std.testing.expectEqual(@as(u32, 0), vhost.getQueueCount());
+}
+
+test "server queue purge command handling" {
+    const allocator = std.testing.allocator;
+
+    var config = try Config.default(allocator);
+    defer config.deinit(allocator);
+
+    var server = try Server.init(allocator, config);
+    defer server.deinit();
+
+    const vhost = server.getVirtualHost("/").?;
+
+    // Create test queue
+    _ = try vhost.declareQueue("test-purge-queue", false, false, false, null);
+
+    // Verify queue exists
+    const queue = vhost.getQueue("test-purge-queue");
+    try std.testing.expect(queue != null);
+
+    // Test purging empty queue
+    const message_count1 = try vhost.purgeQueue("test-purge-queue");
+    try std.testing.expectEqual(@as(u32, 0), message_count1);
+
+    // Verify queue still exists after purge
+    try std.testing.expect(vhost.getQueue("test-purge-queue") != null);
+    try std.testing.expectEqual(@as(u32, 1), vhost.getQueueCount());
 }
