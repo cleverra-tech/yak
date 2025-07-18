@@ -166,7 +166,7 @@ pub const ConnectionStartOk = struct {
     locale: []const u8,
 
     pub fn decode(data: []const u8, allocator: std.mem.Allocator) !ConnectionStartOk {
-        var reader = std.io.fixedBufferStream(data).reader();
+        const reader = std.io.fixedBufferStream(data).reader();
 
         const client_properties = try readShortString(reader, allocator);
         const mechanism = try readShortString(reader, allocator);
@@ -221,7 +221,7 @@ pub const ConnectionOpen = struct {
     insist: bool,
 
     pub fn decode(data: []const u8, allocator: std.mem.Allocator) !ConnectionOpen {
-        var reader = std.io.fixedBufferStream(data).reader();
+        const reader = std.io.fixedBufferStream(data).reader();
 
         const virtual_host = try readShortString(reader, allocator);
         const capabilities = try readShortString(reader, allocator);
@@ -242,7 +242,7 @@ pub const BasicPublish = struct {
     immediate: bool,
 
     pub fn decode(data: []const u8, allocator: std.mem.Allocator) !BasicPublish {
-        var reader = std.io.fixedBufferStream(data).reader();
+        const reader = std.io.fixedBufferStream(data).reader();
 
         _ = try reader.readInt(u16, .big); // reserved
         const exchange = try readShortString(reader, allocator);
@@ -268,7 +268,7 @@ pub const BasicConsume = struct {
     arguments: []const u8, // Field table
 
     pub fn decode(data: []const u8, allocator: std.mem.Allocator) !BasicConsume {
-        var reader = std.io.fixedBufferStream(data).reader();
+        const reader = std.io.fixedBufferStream(data).reader();
 
         _ = try reader.readInt(u16, .big); // reserved
         const queue = try readShortString(reader, allocator);

@@ -245,7 +245,7 @@ pub const Connection = struct {
         }
 
         // Read payload
-        var payload = try self.allocator.alloc(u8, payload_size);
+        const payload = try self.allocator.alloc(u8, payload_size);
         defer self.allocator.free(payload);
 
         const payload_bytes = try self.socket.readAll(payload);
