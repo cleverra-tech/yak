@@ -512,6 +512,111 @@ pub const ContentHeader = struct {
     }
 };
 
+// Confirm method structures
+pub const ConfirmSelect = struct {
+    nowait: bool,
+
+    pub fn decode(data: []const u8) !ConfirmSelect {
+        if (data.len < 1) return error.InvalidConfirmSelect;
+        return ConfirmSelect{
+            .nowait = (data[0] & 0x01) != 0,
+        };
+    }
+
+    pub fn encode(self: *const ConfirmSelect, allocator: std.mem.Allocator) ![]u8 {
+        var buffer = std.ArrayList(u8).init(allocator);
+        defer buffer.deinit();
+
+        try buffer.append(if (self.nowait) 1 else 0);
+        return buffer.toOwnedSlice();
+    }
+};
+
+pub const ConfirmSelectOk = struct {
+    pub fn decode(data: []const u8) !ConfirmSelectOk {
+        _ = data; // No arguments
+        return ConfirmSelectOk{};
+    }
+
+    pub fn encode(self: *const ConfirmSelectOk, allocator: std.mem.Allocator) ![]u8 {
+        _ = self; // No arguments
+        return allocator.alloc(u8, 0);
+    }
+};
+
+// Transaction method structures
+pub const TxSelect = struct {
+    pub fn decode(data: []const u8) !TxSelect {
+        _ = data; // No arguments
+        return TxSelect{};
+    }
+
+    pub fn encode(self: *const TxSelect, allocator: std.mem.Allocator) ![]u8 {
+        _ = self; // No arguments
+        return allocator.alloc(u8, 0);
+    }
+};
+
+pub const TxSelectOk = struct {
+    pub fn decode(data: []const u8) !TxSelectOk {
+        _ = data; // No arguments
+        return TxSelectOk{};
+    }
+
+    pub fn encode(self: *const TxSelectOk, allocator: std.mem.Allocator) ![]u8 {
+        _ = self; // No arguments
+        return allocator.alloc(u8, 0);
+    }
+};
+
+pub const TxCommit = struct {
+    pub fn decode(data: []const u8) !TxCommit {
+        _ = data; // No arguments
+        return TxCommit{};
+    }
+
+    pub fn encode(self: *const TxCommit, allocator: std.mem.Allocator) ![]u8 {
+        _ = self; // No arguments
+        return allocator.alloc(u8, 0);
+    }
+};
+
+pub const TxCommitOk = struct {
+    pub fn decode(data: []const u8) !TxCommitOk {
+        _ = data; // No arguments
+        return TxCommitOk{};
+    }
+
+    pub fn encode(self: *const TxCommitOk, allocator: std.mem.Allocator) ![]u8 {
+        _ = self; // No arguments
+        return allocator.alloc(u8, 0);
+    }
+};
+
+pub const TxRollback = struct {
+    pub fn decode(data: []const u8) !TxRollback {
+        _ = data; // No arguments
+        return TxRollback{};
+    }
+
+    pub fn encode(self: *const TxRollback, allocator: std.mem.Allocator) ![]u8 {
+        _ = self; // No arguments
+        return allocator.alloc(u8, 0);
+    }
+};
+
+pub const TxRollbackOk = struct {
+    pub fn decode(data: []const u8) !TxRollbackOk {
+        _ = data; // No arguments
+        return TxRollbackOk{};
+    }
+
+    pub fn encode(self: *const TxRollbackOk, allocator: std.mem.Allocator) ![]u8 {
+        _ = self; // No arguments
+        return allocator.alloc(u8, 0);
+    }
+};
+
 // Helper functions for AMQP encoding/decoding
 fn writeShortString(writer: anytype, str: []const u8) !void {
     try writer.writeInt(u8, @intCast(str.len), .big);

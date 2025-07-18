@@ -13,6 +13,8 @@ const ChannelHandler = @import("channel_handler.zig").ChannelHandler;
 const ExchangeHandler = @import("exchange_handler.zig").ExchangeHandler;
 const QueueHandler = @import("queue_handler.zig").QueueHandler;
 const BasicHandler = @import("basic_handler.zig").BasicHandler;
+const ConfirmHandler = @import("confirm_handler.zig").ConfirmHandler;
+const TxHandler = @import("tx_handler.zig").TxHandler;
 
 const PendingMessage = struct {
     exchange_name: []const u8,
@@ -35,6 +37,8 @@ pub const ProtocolHandler = struct {
     exchange_handler: ExchangeHandler,
     queue_handler: QueueHandler,
     basic_handler: BasicHandler,
+    confirm_handler: ConfirmHandler,
+    tx_handler: TxHandler,
     get_vhost_fn: ?*const fn (vhost_name: []const u8) ?*VirtualHost,
     persist_message_fn: ?*const fn (vhost_name: []const u8, queue_name: []const u8, message: *const Message) anyerror!void,
     error_handler_fn: ?*const fn (error_info: @import("../error/error_handler.zig").ErrorInfo) RecoveryAction,
@@ -50,6 +54,8 @@ pub const ProtocolHandler = struct {
             .exchange_handler = ExchangeHandler.init(allocator),
             .queue_handler = QueueHandler.init(allocator),
             .basic_handler = BasicHandler.init(allocator),
+            .confirm_handler = ConfirmHandler.init(allocator, null),
+            .tx_handler = TxHandler.init(allocator, null),
             .get_vhost_fn = null,
             .persist_message_fn = null,
             .error_handler_fn = null,
@@ -94,6 +100,8 @@ pub const ProtocolHandler = struct {
         self.exchange_handler.setErrorHandler(error_handler_fn);
         self.queue_handler.setErrorHandler(error_handler_fn);
         self.basic_handler.setErrorHandler(error_handler_fn);
+        self.confirm_handler.error_handler_fn = error_handler_fn;
+        self.tx_handler.error_handler_fn = error_handler_fn;
     }
 
     pub fn handleConnection(self: *ProtocolHandler, connection: *Connection) !void {
@@ -163,6 +171,8 @@ pub const ProtocolHandler = struct {
             40 => try self.handleExchangeMethod(connection, frame.channel_id, method_id, frame.payload[4..]),
             50 => try self.handleQueueMethod(connection, frame.channel_id, method_id, frame.payload[4..]),
             60 => try self.handleBasicMethod(connection, frame.channel_id, method_id, frame.payload[4..]),
+            85 => try self.handleConfirmMethod(connection, frame.channel_id, method_id, frame.payload[4..]),
+            90 => try self.handleTxMethod(connection, frame.channel_id, method_id, frame.payload[4..]),
             else => {
                 std.log.warn("Unknown method class {} on connection {}", .{ class_id, connection.id });
                 return error.UnknownMethodClass;
@@ -237,6 +247,14 @@ pub const ProtocolHandler = struct {
                 return error.UnknownBasicMethod;
             },
         }
+    }
+
+    fn handleConfirmMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
+        try self.confirm_handler.handleConfirmMethod(connection, channel_id, method_id, payload);
+    }
+
+    fn handleTxMethod(self: *ProtocolHandler, connection: *Connection, channel_id: u16, method_id: u16, payload: []const u8) !void {
+        try self.tx_handler.handleTxMethod(connection, channel_id, method_id, payload);
     }
 };
 

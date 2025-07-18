@@ -2,6 +2,50 @@ const std = @import("std");
 const Frame = @import("../protocol/frame.zig").Frame;
 const FrameType = @import("../protocol/frame.zig").FrameType;
 const Method = @import("../protocol/methods.zig").Method;
+const BasicProperties = @import("../protocol/methods.zig").BasicProperties;
+
+// Supporting data structures for confirm and transaction modes
+pub const PendingConfirm = struct {
+    delivery_tag: u64,
+    exchange_name: []const u8,
+    routing_key: []const u8,
+    mandatory: bool,
+    immediate: bool,
+    timestamp: i64,
+
+    pub fn deinit(self: *PendingConfirm, allocator: std.mem.Allocator) void {
+        allocator.free(self.exchange_name);
+        allocator.free(self.routing_key);
+    }
+};
+
+pub const TransactionMessage = struct {
+    exchange_name: []const u8,
+    routing_key: []const u8,
+    mandatory: bool,
+    immediate: bool,
+    body: []const u8,
+    properties: BasicProperties,
+
+    pub fn deinit(self: *TransactionMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.exchange_name);
+        allocator.free(self.routing_key);
+        allocator.free(self.body);
+        self.properties.deinit(allocator);
+    }
+};
+
+pub const TransactionAck = struct {
+    delivery_tag: u64,
+    multiple: bool,
+    ack_type: AckType,
+};
+
+pub const AckType = enum {
+    ack,
+    nack,
+    reject,
+};
 
 pub const ConnectionState = enum {
     handshake,
@@ -48,6 +92,18 @@ pub const Connection = struct {
         prefetch_count: u16,
         prefetch_size: u32,
         unacked_messages: std.ArrayList(u64),
+
+        // Confirm mode support
+        confirm_mode: bool,
+        next_delivery_tag: std.atomic.Value(u64),
+        pending_confirms: std.HashMap(u64, PendingConfirm, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage),
+
+        // Transaction mode support
+        tx_mode: bool,
+        tx_active: bool,
+        tx_messages: std.ArrayList(TransactionMessage),
+        tx_acks: std.ArrayList(TransactionAck),
+
         allocator: std.mem.Allocator,
 
         pub fn init(allocator: std.mem.Allocator, id: u16, connection_id: u64) Channel {
@@ -59,12 +115,35 @@ pub const Connection = struct {
                 .prefetch_count = 0,
                 .prefetch_size = 0,
                 .unacked_messages = std.ArrayList(u64).init(allocator),
+                .confirm_mode = false,
+                .next_delivery_tag = std.atomic.Value(u64).init(1),
+                .pending_confirms = std.HashMap(u64, PendingConfirm, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage).init(allocator),
+                .tx_mode = false,
+                .tx_active = false,
+                .tx_messages = std.ArrayList(TransactionMessage).init(allocator),
+                .tx_acks = std.ArrayList(TransactionAck).init(allocator),
                 .allocator = allocator,
             };
         }
 
         pub fn deinit(self: *Channel) void {
             self.unacked_messages.deinit();
+
+            // Clean up pending confirms
+            var confirm_iter = self.pending_confirms.iterator();
+            while (confirm_iter.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+            }
+            self.pending_confirms.deinit();
+
+            // Clean up transaction messages
+            for (self.tx_messages.items) |*msg| {
+                msg.deinit(self.allocator);
+            }
+            self.tx_messages.deinit();
+
+            // Clean up transaction acks
+            self.tx_acks.deinit();
         }
 
         pub fn canReceiveMore(self: *const Channel) bool {
@@ -96,6 +175,109 @@ pub const Connection = struct {
                     }
                 }
             }
+        }
+
+        // Confirm mode methods
+        pub fn enableConfirmMode(self: *Channel) !void {
+            if (self.tx_mode) {
+                return error.TransactionModeEnabled;
+            }
+            self.confirm_mode = true;
+        }
+
+        pub fn getNextDeliveryTag(self: *Channel) u64 {
+            return self.next_delivery_tag.fetchAdd(1, .monotonic);
+        }
+
+        pub fn addPendingConfirm(self: *Channel, delivery_tag: u64, exchange_name: []const u8, routing_key: []const u8, mandatory: bool, immediate: bool) !void {
+            const confirm = PendingConfirm{
+                .delivery_tag = delivery_tag,
+                .exchange_name = try self.allocator.dupe(u8, exchange_name),
+                .routing_key = try self.allocator.dupe(u8, routing_key),
+                .mandatory = mandatory,
+                .immediate = immediate,
+                .timestamp = std.time.timestamp(),
+            };
+            try self.pending_confirms.put(delivery_tag, confirm);
+        }
+
+        pub fn confirmMessage(self: *Channel, delivery_tag: u64, multiple: bool) void {
+            if (multiple) {
+                var to_remove = std.ArrayList(u64).init(self.allocator);
+                defer to_remove.deinit();
+
+                var iter = self.pending_confirms.iterator();
+                while (iter.next()) |entry| {
+                    if (entry.key_ptr.* <= delivery_tag) {
+                        to_remove.append(entry.key_ptr.*) catch continue;
+                    }
+                }
+
+                for (to_remove.items) |tag| {
+                    if (self.pending_confirms.fetchRemove(tag)) |kv| {
+                        kv.value.deinit(self.allocator);
+                    }
+                }
+            } else {
+                if (self.pending_confirms.fetchRemove(delivery_tag)) |kv| {
+                    kv.value.deinit(self.allocator);
+                }
+            }
+        }
+
+        // Transaction mode methods
+        pub fn enableTransactionMode(self: *Channel) !void {
+            if (self.confirm_mode) {
+                return error.ConfirmModeEnabled;
+            }
+            self.tx_mode = true;
+            self.tx_active = false;
+        }
+
+        pub fn startTransaction(self: *Channel) void {
+            self.tx_active = true;
+        }
+
+        pub fn addTransactionMessage(self: *Channel, exchange_name: []const u8, routing_key: []const u8, mandatory: bool, immediate: bool, body: []const u8, properties: BasicProperties) !void {
+            const tx_msg = TransactionMessage{
+                .exchange_name = try self.allocator.dupe(u8, exchange_name),
+                .routing_key = try self.allocator.dupe(u8, routing_key),
+                .mandatory = mandatory,
+                .immediate = immediate,
+                .body = try self.allocator.dupe(u8, body),
+                .properties = properties,
+            };
+            try self.tx_messages.append(tx_msg);
+        }
+
+        pub fn addTransactionAck(self: *Channel, delivery_tag: u64, multiple: bool, ack_type: AckType) !void {
+            const tx_ack = TransactionAck{
+                .delivery_tag = delivery_tag,
+                .multiple = multiple,
+                .ack_type = ack_type,
+            };
+            try self.tx_acks.append(tx_ack);
+        }
+
+        pub fn commitTransaction(self: *Channel) void {
+            // TODO: Process all tx_messages and tx_acks atomically
+            // For now, just clear them
+            for (self.tx_messages.items) |*msg| {
+                msg.deinit(self.allocator);
+            }
+            self.tx_messages.clearRetainingCapacity();
+            self.tx_acks.clearRetainingCapacity();
+            self.tx_active = false;
+        }
+
+        pub fn rollbackTransaction(self: *Channel) void {
+            // Clear all pending transaction messages and acks
+            for (self.tx_messages.items) |*msg| {
+                msg.deinit(self.allocator);
+            }
+            self.tx_messages.clearRetainingCapacity();
+            self.tx_acks.clearRetainingCapacity();
+            self.tx_active = false;
         }
     };
 
