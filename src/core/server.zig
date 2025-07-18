@@ -368,12 +368,14 @@ pub const Server = struct {
 
             // Basic command handling
             if (std.mem.eql(u8, command, "help")) {
-                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  list queues [vhost] - List all queues in virtual host (default: /)\n  queue info <name> [vhost] - Show detailed information about a queue\n  exit - Close connection\n";
+                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  list queues [vhost] - List all queues in virtual host (default: /)\n  queue info <name> [vhost] - Show detailed information about a queue\n  queue declare <name> [--durable] [--exclusive] [--auto-delete] [vhost] - Create a new queue\n  exit - Close connection\n";
                 try connection.stream.writeAll(help_msg);
             } else if (std.mem.startsWith(u8, command, "list queues")) {
                 try self.handleListQueuesCommand(connection, command);
             } else if (std.mem.startsWith(u8, command, "queue info")) {
                 try self.handleQueueInfoCommand(connection, command);
+            } else if (std.mem.startsWith(u8, command, "queue declare")) {
+                try self.handleQueueDeclareCommand(connection, command);
             } else if (std.mem.eql(u8, command, "status")) {
                 const status_msg = try std.fmt.allocPrint(self.allocator, "Server Status:\n  Running: {}\n  Connections: {}\n  Virtual Hosts: {}\n  Shutdown Requested: {}\n", .{
                     self.running,
@@ -543,6 +545,74 @@ pub const Server = struct {
             const no_bindings = "  No bindings configured\n";
             try connection.stream.writeAll(no_bindings);
         }
+    }
+
+    fn handleQueueDeclareCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        // Parse command to extract queue name, flags, and optional virtual host name
+        var parts = std.mem.splitSequence(u8, command, " ");
+        _ = parts.next(); // "queue"
+        _ = parts.next(); // "declare"
+
+        const queue_name = parts.next() orelse {
+            const error_msg = "Error: Queue name is required. Usage: queue declare <name> [--durable] [--exclusive] [--auto-delete] [vhost]\n";
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        // Parse optional flags and virtual host
+        var durable = false;
+        var exclusive = false;
+        var auto_delete = false;
+        var vhost_name: []const u8 = "/"; // Default virtual host
+
+        while (parts.next()) |part| {
+            const trimmed_part = std.mem.trim(u8, part, " \t\n\r");
+            if (std.mem.eql(u8, trimmed_part, "--durable")) {
+                durable = true;
+            } else if (std.mem.eql(u8, trimmed_part, "--exclusive")) {
+                exclusive = true;
+            } else if (std.mem.eql(u8, trimmed_part, "--auto-delete")) {
+                auto_delete = true;
+            } else if (!std.mem.startsWith(u8, trimmed_part, "--")) {
+                // Assume it's a virtual host name if it doesn't start with --
+                vhost_name = trimmed_part;
+            }
+        }
+
+        // Get the virtual host
+        const vhost = self.getVirtualHost(vhost_name);
+        if (vhost == null) {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error: Virtual host '{s}' not found\n", .{vhost_name});
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        }
+
+        // Declare the queue
+        const actual_queue_name = vhost.?.declareQueue(queue_name, durable, exclusive, auto_delete, null) catch |err| {
+            const error_msg = try std.fmt.allocPrint(self.allocator, "Error creating queue '{s}': {}\n", .{ queue_name, err });
+            defer self.allocator.free(error_msg);
+            try connection.stream.writeAll(error_msg);
+            return;
+        };
+
+        // Send success response
+        const success_msg = try std.fmt.allocPrint(self.allocator,
+            \\Queue declared successfully: {s}
+            \\  Virtual Host: {s}
+            \\  Durable: {}
+            \\  Exclusive: {}
+            \\  Auto Delete: {}
+            \\
+        , .{
+            actual_queue_name,
+            vhost_name,
+            durable,
+            exclusive,
+            auto_delete,
+        });
+        defer self.allocator.free(success_msg);
+        try connection.stream.writeAll(success_msg);
     }
 
     fn handleConnectionWithRecovery(self: *Server, client_socket: std.net.Server.Connection) void {
@@ -932,4 +1002,46 @@ test "server queue info command handling" {
     try std.testing.expectEqual(true, queue.?.durable);
     try std.testing.expectEqual(false, queue.?.exclusive);
     try std.testing.expectEqual(false, queue.?.auto_delete);
+}
+
+test "server queue declare command handling" {
+    const allocator = std.testing.allocator;
+
+    var config = try Config.default(allocator);
+    defer config.deinit(allocator);
+
+    var server = try Server.init(allocator, config);
+    defer server.deinit();
+
+    const vhost = server.getVirtualHost("/").?;
+
+    // Test declaring a basic queue
+    const queue_name1 = try vhost.declareQueue("test-declare-basic", false, false, false, null);
+    try std.testing.expectEqualStrings("test-declare-basic", queue_name1);
+
+    const queue1 = vhost.getQueue("test-declare-basic");
+    try std.testing.expect(queue1 != null);
+    try std.testing.expectEqual(false, queue1.?.durable);
+    try std.testing.expectEqual(false, queue1.?.exclusive);
+    try std.testing.expectEqual(false, queue1.?.auto_delete);
+
+    // Test declaring a durable queue
+    const queue_name2 = try vhost.declareQueue("test-declare-durable", true, false, false, null);
+    try std.testing.expectEqualStrings("test-declare-durable", queue_name2);
+
+    const queue2 = vhost.getQueue("test-declare-durable");
+    try std.testing.expect(queue2 != null);
+    try std.testing.expectEqual(true, queue2.?.durable);
+    try std.testing.expectEqual(false, queue2.?.exclusive);
+    try std.testing.expectEqual(false, queue2.?.auto_delete);
+
+    // Test declaring an exclusive auto-delete queue
+    const queue_name3 = try vhost.declareQueue("test-declare-exclusive", false, true, true, null);
+    try std.testing.expectEqualStrings("test-declare-exclusive", queue_name3);
+
+    const queue3 = vhost.getQueue("test-declare-exclusive");
+    try std.testing.expect(queue3 != null);
+    try std.testing.expectEqual(false, queue3.?.durable);
+    try std.testing.expectEqual(true, queue3.?.exclusive);
+    try std.testing.expectEqual(true, queue3.?.auto_delete);
 }
