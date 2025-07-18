@@ -149,6 +149,62 @@ pub const Server = struct {
         }
     }
 
+    pub fn startWithShutdownMonitoring(self: *Server, shutdown_flag: *const bool) !void {
+        std.log.info("Starting Yak AMQP server on {s}:{}", .{ self.config.tcp.host, self.config.tcp.port });
+
+        const address = try std.net.Address.parseIp(self.config.tcp.host, self.config.tcp.port);
+        self.tcp_server = try address.listen(.{
+            .reuse_address = true,
+        });
+
+        self.running = true;
+
+        // Start accepting connections with shutdown monitoring
+        while (self.running and !shutdown_flag.*) {
+            // Use accept with timeout to periodically check shutdown flag
+            const client_socket = self.acceptWithTimeout(100) catch |err| switch (err) {
+                error.WouldBlock => continue, // Timeout, check shutdown flag
+                else => {
+                    std.log.err("Failed to accept connection: {}", .{err});
+                    continue;
+                },
+            };
+
+            if (client_socket) |socket| {
+                // Handle connection in a separate thread (simplified for now)
+                self.handleConnection(socket) catch |err| {
+                    std.log.err("Failed to handle connection: {}", .{err});
+                    socket.stream.close();
+                };
+            }
+        }
+
+        if (shutdown_flag.*) {
+            std.log.info("Shutdown signal received, stopping server gracefully", .{});
+            self.stop();
+        }
+    }
+
+    fn acceptWithTimeout(self: *Server, timeout_ms: u32) !?std.net.Server.Connection {
+        _ = timeout_ms;
+
+        // Use poll to check if socket is ready with timeout
+        var pollfds = [_]std.posix.pollfd{
+            std.posix.pollfd{
+                .fd = self.tcp_server.?.stream.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+
+        const poll_result = try std.posix.poll(&pollfds, 100); // 100ms timeout
+        if (poll_result == 0) {
+            return null; // Timeout
+        }
+
+        return try self.tcp_server.?.accept();
+    }
+
     pub fn stop(self: *Server) void {
         self.running = false;
         if (self.tcp_server) |*server| {

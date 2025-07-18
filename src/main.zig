@@ -35,8 +35,8 @@ pub fn main() !void {
         std.log.info("CLI server listening on {s}", .{config.cli.socket_path});
     }
 
-    // Start main server
-    try server.start();
+    // Start main server with shutdown monitoring
+    try server.startWithShutdownMonitoring(&shutdown_requested);
 }
 
 fn loadConfig(allocator: std.mem.Allocator, args: []const []const u8) !Config {
@@ -76,9 +76,18 @@ fn loadConfig(allocator: std.mem.Allocator, args: []const []const u8) !Config {
 }
 
 fn setupSignalHandlers() !void {
-    // TODO: Implement proper signal handling for graceful shutdown
-    // This is a simplified stub for now
-    std.log.info("Signal handlers setup (stub implementation)", .{});
+    const mask = std.posix.sigemptyset();
+
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = handleSignal },
+        .mask = mask,
+        .flags = 0,
+    };
+
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+
+    std.log.info("Signal handlers registered for SIGINT and SIGTERM", .{});
 }
 
 var shutdown_requested: bool = false;
