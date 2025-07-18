@@ -293,8 +293,8 @@ pub const Exchange = struct {
 
 // Topic pattern matching using std.mem operations (no regex dependency)
 fn matchTopicWildcards(pattern: []const u8, routing_key: []const u8) bool {
-    var pattern_parts = std.mem.split(u8, pattern, ".");
-    var key_parts = std.mem.split(u8, routing_key, ".");
+    var pattern_parts = std.mem.splitScalar(u8, pattern, '.');
+    var key_parts = std.mem.splitScalar(u8, routing_key, '.');
 
     var pattern_list = std.ArrayList([]const u8).init(std.heap.page_allocator);
     defer pattern_list.deinit();

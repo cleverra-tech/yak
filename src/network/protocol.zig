@@ -9,6 +9,7 @@ const ContentHeader = @import("../protocol/methods.zig").ContentHeader;
 const BasicProperties = @import("../protocol/methods.zig").BasicProperties;
 const VirtualHost = @import("../core/vhost.zig").VirtualHost;
 const ExchangeType = @import("../routing/exchange.zig").ExchangeType;
+const Message = @import("../message.zig").Message;
 
 // Structure to track messages in progress (Basic.Publish -> Content Header -> Content Body)
 const PendingMessage = struct {
@@ -19,7 +20,7 @@ const PendingMessage = struct {
     header: ?ContentHeader,
     body_data: std.ArrayList(u8),
     expected_body_size: u64,
-    
+
     pub fn init(allocator: std.mem.Allocator, exchange_name: []const u8, routing_key: []const u8, mandatory: bool, immediate: bool) !PendingMessage {
         return PendingMessage{
             .exchange_name = try allocator.dupe(u8, exchange_name),
@@ -31,7 +32,7 @@ const PendingMessage = struct {
             .expected_body_size = 0,
         };
     }
-    
+
     pub fn deinit(self: *PendingMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.exchange_name);
         allocator.free(self.routing_key);
@@ -47,6 +48,7 @@ pub const ProtocolHandler = struct {
     server_properties: std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     get_vhost_fn: ?*const fn (vhost_name: []const u8) ?*VirtualHost,
     pending_messages: std.HashMap(u64, PendingMessage, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage), // channel_id -> PendingMessage
+    next_message_id: u64,
 
     pub fn init(allocator: std.mem.Allocator) ProtocolHandler {
         var handler = ProtocolHandler{
@@ -54,6 +56,7 @@ pub const ProtocolHandler = struct {
             .server_properties = std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .get_vhost_fn = null,
             .pending_messages = std.HashMap(u64, PendingMessage, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage).init(allocator),
+            .next_message_id = 1,
         };
 
         // Initialize server properties
@@ -71,7 +74,7 @@ pub const ProtocolHandler = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.server_properties.deinit();
-        
+
         // Clean up pending messages
         var pending_iterator = self.pending_messages.iterator();
         while (pending_iterator.next()) |entry| {
@@ -1327,17 +1330,17 @@ pub const ProtocolHandler = struct {
 
         // Create pending message to track content header and body frames
         const channel_key = (@as(u64, connection.id) << 16) | channel_id;
-        
+
         // Remove any existing pending message for this channel
         if (self.pending_messages.fetchRemove(channel_key)) |existing| {
             var existing_msg = existing.value;
             existing_msg.deinit(self.allocator);
         }
-        
+
         // Create new pending message
         const pending_message = try PendingMessage.init(self.allocator, exchange_name, routing_key, mandatory, immediate);
         try self.pending_messages.put(channel_key, pending_message);
-        
+
         // TODO: Handle immediate flag
         _ = exchange; // Will be used when routing the complete message
 
@@ -1565,7 +1568,7 @@ pub const ProtocolHandler = struct {
 
         // Parse content header
         const content_header = try ContentHeader.decode(frame.payload, self.allocator);
-        
+
         // Validate class ID (should be 60 for Basic class)
         if (content_header.class_id != 60) {
             content_header.deinit(self.allocator);
@@ -1586,10 +1589,44 @@ pub const ProtocolHandler = struct {
     }
 
     fn handleBodyFrame(self: *ProtocolHandler, connection: *Connection, frame: Frame) !void {
-        _ = self;
+        // Check if channel exists
+        const channel = connection.getChannel(frame.channel_id) orelse {
+            std.log.warn("Content body frame on non-existent channel {} on connection {}", .{ frame.channel_id, connection.id });
+            return error.ChannelNotFound;
+        };
 
-        // TODO: Implement content body handling
-        std.log.debug("Body frame not yet implemented: connection={}, channel={}", .{ connection.id, frame.channel_id });
+        if (!channel.active) {
+            return error.ChannelNotActive;
+        }
+
+        // Get pending message for this channel
+        const channel_key = (@as(u64, connection.id) << 16) | frame.channel_id;
+        var pending_message = self.pending_messages.getPtr(channel_key) orelse {
+            std.log.warn("Content body frame without preceding Basic.Publish/Header on channel {} connection {}", .{ frame.channel_id, connection.id });
+            return error.UnexpectedContentBody;
+        };
+
+        // Verify we have a content header
+        if (pending_message.header == null) {
+            std.log.warn("Content body frame without content header on channel {} connection {}", .{ frame.channel_id, connection.id });
+            return error.MissingContentHeader;
+        }
+
+        // Append body data
+        try pending_message.body_data.appendSlice(frame.payload);
+
+        std.log.debug("Content body received: channel={}, body_chunk_size={}, total_size={}/{}, connection={}", .{ frame.channel_id, frame.payload.len, pending_message.body_data.items.len, pending_message.expected_body_size, connection.id });
+
+        // Check if we have received all expected body data
+        if (pending_message.body_data.items.len >= pending_message.expected_body_size) {
+            if (pending_message.body_data.items.len > pending_message.expected_body_size) {
+                std.log.warn("Received more body data than expected: {} > {} on channel {} connection {}", .{ pending_message.body_data.items.len, pending_message.expected_body_size, frame.channel_id, connection.id });
+                return error.ExcessiveBodyData;
+            }
+
+            // Complete the message
+            try self.completeMessage(connection, frame.channel_id);
+        }
     }
 
     fn handleHeartbeatFrame(self: *ProtocolHandler, connection: *Connection, frame: Frame) !void {
@@ -1607,14 +1644,14 @@ pub const ProtocolHandler = struct {
 
     fn completeMessage(self: *ProtocolHandler, connection: *Connection, channel_id: u16) !void {
         const channel_key = (@as(u64, connection.id) << 16) | channel_id;
-        
+
         const pending_entry = self.pending_messages.fetchRemove(channel_key) orelse {
             std.log.warn("Attempted to complete non-existent pending message on channel {} connection {}", .{ channel_id, connection.id });
             return error.NoPendingMessage;
         };
         var pending_message = pending_entry.value;
         defer pending_message.deinit(self.allocator);
-        
+
         // Get virtual host for message routing
         const vhost = self.getVirtualHost(connection) orelse {
             std.log.warn("Cannot complete message on connection {} with no virtual host", .{connection.id});
@@ -1631,12 +1668,59 @@ pub const ProtocolHandler = struct {
             return; // Silently drop non-mandatory message
         };
 
-        // TODO: Create complete message object and route through exchange
-        // For now, just log the completion
-        _ = exchange;
-        
-        std.log.debug("Message completed: exchange={s}, routing_key={s}, body_size={}, channel={}, connection={}", 
-                     .{ pending_message.exchange_name, pending_message.routing_key, pending_message.body_data.items.len, channel_id, connection.id });
+        // Create complete message object
+        const message_id = self.next_message_id;
+        self.next_message_id += 1;
+
+        var message = try Message.init(self.allocator, message_id, pending_message.exchange_name, pending_message.routing_key, pending_message.body_data.items);
+        defer message.deinit();
+
+        // Set message properties from content header if available
+        if (pending_message.header) |header| {
+            if (header.properties.delivery_mode) |dm| {
+                if (dm == 2) message.markPersistent();
+            }
+            
+            // Set content-type header if present
+            if (header.properties.content_type) |ct| {
+                try message.setHeader("content-type", ct);
+            }
+            
+            // Set content-encoding header if present
+            if (header.properties.content_encoding) |ce| {
+                try message.setHeader("content-encoding", ce);
+            }
+            
+            // Set correlation-id header if present
+            if (header.properties.correlation_id) |ci| {
+                try message.setHeader("correlation-id", ci);
+            }
+            
+            // Set reply-to header if present
+            if (header.properties.reply_to) |rt| {
+                try message.setHeader("reply-to", rt);
+            }
+            
+            // Set message-id header if present
+            if (header.properties.message_id) |mi| {
+                try message.setHeader("message-id", mi);
+            }
+            
+            // Set user-id header if present
+            if (header.properties.user_id) |ui| {
+                try message.setHeader("user-id", ui);
+            }
+            
+            // Set app-id header if present
+            if (header.properties.app_id) |ai| {
+                try message.setHeader("app-id", ai);
+            }
+        }
+
+        // Route message through exchange
+        _ = try exchange.routeMessage(&message, self.allocator);
+
+        std.log.debug("Message routed: exchange={s}, routing_key={s}, body_size={}, message_id={}, channel={}, connection={}", .{ pending_message.exchange_name, pending_message.routing_key, pending_message.body_data.items.len, message_id, channel_id, connection.id });
     }
 
     fn encodeFieldTable(self: *ProtocolHandler, table: std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage)) ![]u8 {
