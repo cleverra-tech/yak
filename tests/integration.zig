@@ -28,7 +28,7 @@ fn createTestServer(allocator: std.mem.Allocator) !Server {
 
 test "server lifecycle and basic operations" {
     const allocator = std.testing.allocator;
-    
+
     var server = try createTestServer(allocator);
     defer server.deinit();
 
@@ -52,7 +52,7 @@ test "server lifecycle and basic operations" {
     // Test server stats
     const stats = try server.getStats(allocator);
     defer stats.object.deinit();
-    
+
     try std.testing.expect(stats.object.contains("connections"));
     try std.testing.expect(stats.object.contains("virtual_hosts"));
     try std.testing.expect(stats.object.contains("errors"));
@@ -60,7 +60,7 @@ test "server lifecycle and basic operations" {
 
 test "virtual host operations and resource management" {
     const allocator = std.testing.allocator;
-    
+
     var server = try createTestServer(allocator);
     defer server.deinit();
 
@@ -112,7 +112,7 @@ test "virtual host operations and resource management" {
 
 test "message publishing and routing through exchanges" {
     const allocator = std.testing.allocator;
-    
+
     var server = try createTestServer(allocator);
     defer server.deinit();
 
@@ -175,7 +175,7 @@ test "message publishing and routing through exchanges" {
 
 test "queue message operations and consumer management" {
     const allocator = std.testing.allocator;
-    
+
     var server = try createTestServer(allocator);
     defer server.deinit();
 
@@ -244,10 +244,10 @@ test "queue message operations and consumer management" {
 
 test "message persistence and recovery" {
     const allocator = std.testing.allocator;
-    
+
     // Clean up any existing test persistence data
     std.fs.cwd().deleteTree("./yak_persistence") catch {};
-    
+
     // Create server and test persistence
     {
         var server = try createTestServer(allocator);
@@ -293,7 +293,7 @@ test "message persistence and recovery" {
         // Messages should be recovered during server initialization
         // (In a real scenario, this would happen automatically)
         // For this test, we verify that persistence files exist
-        
+
         const file = std.fs.cwd().openFile("./yak_persistence/vhost_//queue_durable.queue.dat", .{}) catch |err| switch (err) {
             error.FileNotFound => {
                 // Skip persistence test if no file exists
@@ -315,14 +315,14 @@ test "message persistence and recovery" {
 
 test "error handling and recovery mechanisms" {
     const allocator = std.testing.allocator;
-    
+
     var server = try createTestServer(allocator);
     defer server.deinit();
 
     // Test error handler initialization
     const error_stats = try server.error_handler.getErrorStats(allocator);
     defer error_stats.object.deinit();
-    
+
     try std.testing.expect(error_stats.object.contains("total_errors"));
     try std.testing.expect(error_stats.object.contains("fatal_errors"));
     try std.testing.expect(error_stats.object.contains("recent_errors"));
@@ -355,11 +355,11 @@ test "error handling and recovery mechanisms" {
     // Test queue deletion with constraints
     _ = try vhost.?.declareQueue("delete.test", false, false, false, null);
     const delete_queue = vhost.?.getQueue("delete.test").?;
-    
+
     // Add a message to make queue non-empty
     var message = try Message.init(allocator, 1, "test", "key", "test");
     try delete_queue.publish(message);
-    
+
     // Try to delete non-empty queue with if_empty=true (should fail)
     const delete_result = vhost.?.deleteQueue("delete.test", false, true);
     try std.testing.expectError(error.QueueNotEmpty, delete_result);
@@ -367,7 +367,7 @@ test "error handling and recovery mechanisms" {
 
 test "server statistics and monitoring" {
     const allocator = std.testing.allocator;
-    
+
     var server = try createTestServer(allocator);
     defer server.deinit();
 
@@ -436,7 +436,7 @@ test "server statistics and monitoring" {
 
 test "full AMQP workflow simulation" {
     const allocator = std.testing.allocator;
-    
+
     var server = try createTestServer(allocator);
     defer server.deinit();
 
@@ -470,10 +470,10 @@ test "full AMQP workflow simulation" {
     var new_order = try Message.init(allocator, 1, "orders", "new", "{\"order_id\":123,\"amount\":99.99}");
     defer new_order.deinit();
     try new_order.setHeader("content-type", "application/json");
-    
+
     var update_order = try Message.init(allocator, 2, "orders", "update", "{\"order_id\":123,\"status\":\"processing\"}");
     defer update_order.deinit();
-    
+
     var cancel_order = try Message.init(allocator, 3, "orders", "cancel", "{\"order_id\":124,\"reason\":\"user_request\"}");
     defer cancel_order.deinit();
 

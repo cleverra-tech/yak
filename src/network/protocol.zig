@@ -294,7 +294,179 @@ pub const ProtocolHandler = struct {
     }
 
     fn handleConnectionStartOk(self: *ProtocolHandler, connection: *Connection, payload: []const u8) !void {
-        _ = payload; // TODO: Parse client properties, mechanism, response, locale
+        var offset: usize = 0;
+
+        // Parse client properties (field table)
+        if (offset + 4 > payload.len) {
+            const error_info = ErrorHelpers.connectionError(.syntax_error, "Invalid Connection.StartOk payload: missing client properties length", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidStartOk;
+        }
+
+        const properties_len = std.mem.readInt(u32, payload[offset .. offset + 4][0..4], .big);
+        offset += 4;
+
+        if (offset + properties_len > payload.len) {
+            const error_info = ErrorHelpers.connectionError(.syntax_error, "Invalid Connection.StartOk payload: client properties data truncated", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidStartOk;
+        }
+
+        // Parse client properties field table
+        var client_properties = if (properties_len > 0)
+            self.parseFieldTable(payload[offset .. offset + properties_len]) catch |err| {
+                const error_info = ErrorHelpers.connectionError(.syntax_error, "Failed to parse client properties field table", connection.id);
+                if (self.error_handler_fn) |handle_error| {
+                    _ = handle_error(error_info);
+                }
+                return err;
+            }
+        else
+            std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(self.allocator);
+        defer self.freeFieldTable(&client_properties);
+
+        offset += properties_len;
+
+        // Parse mechanism (long string)
+        if (offset + 4 > payload.len) {
+            const error_info = ErrorHelpers.connectionError(.syntax_error, "Invalid Connection.StartOk payload: missing mechanism length", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidStartOk;
+        }
+
+        const mechanism_len = std.mem.readInt(u32, payload[offset .. offset + 4][0..4], .big);
+        offset += 4;
+
+        if (offset + mechanism_len > payload.len) {
+            const error_info = ErrorHelpers.connectionError(.syntax_error, "Invalid Connection.StartOk payload: mechanism data truncated", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidStartOk;
+        }
+
+        const mechanism = payload[offset .. offset + mechanism_len];
+        offset += mechanism_len;
+
+        // Parse response (long string)
+        if (offset + 4 > payload.len) {
+            const error_info = ErrorHelpers.connectionError(.syntax_error, "Invalid Connection.StartOk payload: missing response length", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidStartOk;
+        }
+
+        const response_len = std.mem.readInt(u32, payload[offset .. offset + 4][0..4], .big);
+        offset += 4;
+
+        if (offset + response_len > payload.len) {
+            const error_info = ErrorHelpers.connectionError(.syntax_error, "Invalid Connection.StartOk payload: response data truncated", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidStartOk;
+        }
+
+        const response = payload[offset .. offset + response_len];
+        offset += response_len;
+
+        // Parse locale (long string)
+        if (offset + 4 > payload.len) {
+            const error_info = ErrorHelpers.connectionError(.syntax_error, "Invalid Connection.StartOk payload: missing locale length", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidStartOk;
+        }
+
+        const locale_len = std.mem.readInt(u32, payload[offset .. offset + 4][0..4], .big);
+        offset += 4;
+
+        if (offset + locale_len > payload.len) {
+            const error_info = ErrorHelpers.connectionError(.syntax_error, "Invalid Connection.StartOk payload: locale data truncated", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidStartOk;
+        }
+
+        const locale = payload[offset .. offset + locale_len];
+
+        // Validate mechanism (currently only PLAIN is supported)
+        if (!std.mem.eql(u8, mechanism, "PLAIN")) {
+            const error_info = ErrorHelpers.connectionError(.access_refused, "Unsupported authentication mechanism", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.UnsupportedAuthMechanism;
+        }
+
+        // Parse PLAIN authentication response (format: \0username\0password)
+        if (response.len < 3) { // At least 2 null bytes + 1 char for minimal valid auth
+            const error_info = ErrorHelpers.connectionError(.access_refused, "Invalid PLAIN authentication response", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidAuthResponse;
+        }
+
+        // Find the null separators in PLAIN response
+        var null_count: u32 = 0;
+        var first_null: ?usize = null;
+        var second_null: ?usize = null;
+
+        for (response, 0..) |byte, i| {
+            if (byte == 0) {
+                null_count += 1;
+                if (first_null == null) {
+                    first_null = i;
+                } else if (second_null == null) {
+                    second_null = i;
+                    break;
+                }
+            }
+        }
+
+        if (null_count < 2 or first_null == null or second_null == null) {
+            const error_info = ErrorHelpers.connectionError(.access_refused, "Malformed PLAIN authentication response", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidAuthResponse;
+        }
+
+        // Extract authzid (authorization identity), authcid (username), and password
+        const authzid = response[0..first_null.?];
+        const username = response[first_null.? + 1 .. second_null.?];
+        const password = response[second_null.? + 1 ..];
+
+        // For now, accept any non-empty username/password combination
+        // In a production system, this would validate against a user database
+        if (username.len == 0 or password.len == 0) {
+            const error_info = ErrorHelpers.connectionError(.access_refused, "Empty username or password", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidCredentials;
+        }
+
+        // Log connection info (be careful not to log sensitive data)
+        std.log.info("Connection {} authenticated: user={s}, mechanism={s}, locale={s}, authzid={s}", .{ connection.id, username, mechanism, locale, authzid });
+
+        // Log client properties for debugging
+        if (client_properties.count() > 0) {
+            var prop_iter = client_properties.iterator();
+            while (prop_iter.next()) |entry| {
+                std.log.debug("Client property: {s} = {s}", .{ entry.key_ptr.*, entry.value_ptr.* });
+            }
+        }
 
         connection.setState(.start_ok_received);
 
@@ -401,7 +573,82 @@ pub const ProtocolHandler = struct {
     }
 
     fn handleConnectionClose(self: *ProtocolHandler, connection: *Connection, payload: []const u8) !void {
-        _ = payload; // TODO: Parse close reason
+        var offset: usize = 0;
+
+        // Parse close reason (Connection.Close method format: reply_code, reply_text, class_id, method_id)
+        if (offset + 2 > payload.len) {
+            const error_info = ErrorHelpers.connectionError(.syntax_error, "Invalid Connection.Close payload: missing reply code", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidConnectionClose;
+        }
+
+        const reply_code = std.mem.readInt(u16, payload[offset .. offset + 2][0..2], .big);
+        offset += 2;
+
+        // Parse reply text (short string)
+        if (offset >= payload.len) {
+            const error_info = ErrorHelpers.connectionError(.syntax_error, "Invalid Connection.Close payload: missing reply text length", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidConnectionClose;
+        }
+
+        const reply_text_len = payload[offset];
+        offset += 1;
+
+        if (offset + reply_text_len > payload.len) {
+            const error_info = ErrorHelpers.connectionError(.syntax_error, "Invalid Connection.Close payload: reply text data truncated", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidConnectionClose;
+        }
+
+        const reply_text = payload[offset .. offset + reply_text_len];
+        offset += reply_text_len;
+
+        // Parse class ID
+        if (offset + 2 > payload.len) {
+            const error_info = ErrorHelpers.connectionError(.syntax_error, "Invalid Connection.Close payload: missing class ID", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidConnectionClose;
+        }
+
+        const class_id = std.mem.readInt(u16, payload[offset .. offset + 2][0..2], .big);
+        offset += 2;
+
+        // Parse method ID
+        if (offset + 2 > payload.len) {
+            const error_info = ErrorHelpers.connectionError(.syntax_error, "Invalid Connection.Close payload: missing method ID", connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+            return error.InvalidConnectionClose;
+        }
+
+        const method_id = std.mem.readInt(u16, payload[offset .. offset + 2][0..2], .big);
+
+        // Log connection close details
+        std.log.info("Connection {} closing: code={}, reason={s}, class={}, method={}", .{ connection.id, reply_code, reply_text, class_id, method_id });
+
+        // Log error-level message if reply code indicates an error
+        if (reply_code != 200) { // 200 is normal closure
+            std.log.err("Connection {} closed with error: code={}, reason={s}", .{ connection.id, reply_code, reply_text });
+
+            // Report error through error handler
+            const error_msg = std.fmt.allocPrint(self.allocator, "Connection closed by client: {s}", .{reply_text}) catch "Connection closed by client";
+            defer if (error_msg.ptr != "Connection closed by client".ptr) self.allocator.free(error_msg);
+
+            const error_info = ErrorHelpers.connectionError(.connection_forced, error_msg, connection.id);
+            if (self.error_handler_fn) |handle_error| {
+                _ = handle_error(error_info);
+            }
+        }
 
         connection.setState(.closing);
 
@@ -1845,6 +2092,104 @@ pub const ProtocolHandler = struct {
         }
 
         return buffer.toOwnedSlice();
+    }
+
+    fn parseFieldTable(self: *ProtocolHandler, data: []const u8) !std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage) {
+        var table = std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(self.allocator);
+        var offset: usize = 0;
+
+        while (offset < data.len) {
+            // Parse key (short string)
+            if (offset >= data.len) break;
+            const key_len = data[offset];
+            offset += 1;
+
+            if (offset + key_len > data.len) break;
+            const key = try self.allocator.dupe(u8, data[offset .. offset + key_len]);
+            offset += key_len;
+
+            // Parse value type
+            if (offset >= data.len) {
+                self.allocator.free(key);
+                break;
+            }
+            const value_type = data[offset];
+            offset += 1;
+
+            // Parse value based on type
+            switch (value_type) {
+                'S' => { // Long string
+                    if (offset + 4 > data.len) {
+                        self.allocator.free(key);
+                        break;
+                    }
+                    const value_len = std.mem.readInt(u32, data[offset .. offset + 4][0..4], .big);
+                    offset += 4;
+
+                    if (offset + value_len > data.len) {
+                        self.allocator.free(key);
+                        break;
+                    }
+                    const value = try self.allocator.dupe(u8, data[offset .. offset + value_len]);
+                    offset += value_len;
+
+                    try table.put(key, value);
+                },
+                's' => { // Short string
+                    if (offset >= data.len) {
+                        self.allocator.free(key);
+                        break;
+                    }
+                    const value_len = data[offset];
+                    offset += 1;
+
+                    if (offset + value_len > data.len) {
+                        self.allocator.free(key);
+                        break;
+                    }
+                    const value = try self.allocator.dupe(u8, data[offset .. offset + value_len]);
+                    offset += value_len;
+
+                    try table.put(key, value);
+                },
+                't' => { // Boolean (true)
+                    const value = try self.allocator.dupe(u8, "true");
+                    try table.put(key, value);
+                },
+                'f' => { // Boolean (false)
+                    const value = try self.allocator.dupe(u8, "false");
+                    try table.put(key, value);
+                },
+                'I' => { // Signed 32-bit integer
+                    if (offset + 4 > data.len) {
+                        self.allocator.free(key);
+                        break;
+                    }
+                    const int_value = std.mem.readInt(i32, data[offset .. offset + 4][0..4], .big);
+                    offset += 4;
+
+                    const value = try std.fmt.allocPrint(self.allocator, "{}", .{int_value});
+                    try table.put(key, value);
+                },
+                else => {
+                    // Unknown type, skip this field
+                    std.log.warn("Unknown field table value type: '{c}' for key: {s}", .{ value_type, key });
+                    self.allocator.free(key);
+                    break;
+                },
+            }
+        }
+
+        return table;
+    }
+
+    fn freeFieldTable(self: *ProtocolHandler, table: *std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage)) void {
+        var iterator = table.iterator();
+        while (iterator.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        table.deinit();
     }
 };
 
