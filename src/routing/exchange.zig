@@ -1,5 +1,6 @@
 const std = @import("std");
 const Message = @import("../message.zig").Message;
+const HeaderTable = @import("../message.zig").HeaderTable;
 const Binding = @import("binding.zig").Binding;
 
 pub const ExchangeType = enum {
@@ -183,12 +184,89 @@ pub const Exchange = struct {
     }
 
     fn matchHeaders(self: *Exchange, binding_args: ?[]const u8, message_headers: ?@import("../message.zig").HeaderTable) bool {
-        _ = self;
-        _ = binding_args;
-        _ = message_headers;
-        // TODO: Implement header matching logic
-        // This requires parsing the binding arguments for header match criteria
-        return false;
+
+        // If no binding arguments, match everything (similar to fanout behavior)
+        const args = binding_args orelse return true;
+
+        // If no message headers but binding requires headers, no match
+        const headers = message_headers orelse return false;
+
+        // Parse binding arguments as JSON to extract header match criteria
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const temp_allocator = arena.allocator();
+
+        const parsed = std.json.parseFromSlice(std.json.Value, temp_allocator, args, .{}) catch {
+            return false; // Invalid JSON format
+        };
+        defer parsed.deinit();
+
+        const match_criteria = parsed.value.object;
+
+        // Get match type: "all" (default) or "any"
+        var match_all = true;
+        if (match_criteria.get("x-match")) |x_match_value| {
+            if (x_match_value == .string) {
+                if (std.mem.eql(u8, x_match_value.string, "any")) {
+                    match_all = false;
+                }
+            }
+        }
+
+        var matched_count: u32 = 0;
+        var required_count: u32 = 0;
+
+        // Check each header requirement
+        var criteria_iter = match_criteria.iterator();
+        while (criteria_iter.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const expected_value = entry.value_ptr.*;
+
+            // Skip x-match meta parameter
+            if (std.mem.eql(u8, key, "x-match")) continue;
+
+            required_count += 1;
+
+            // Check if message has this header
+            if (headers.get(key)) |actual_value| {
+                // Compare values based on type
+                const values_match = switch (expected_value) {
+                    .string => |str| std.mem.eql(u8, actual_value, str),
+                    .integer => |int| blk: {
+                        const str_int = std.fmt.parseInt(i64, actual_value, 10) catch break :blk false;
+                        break :blk str_int == int;
+                    },
+                    .float => |float| blk: {
+                        const str_float = std.fmt.parseFloat(f64, actual_value) catch break :blk false;
+                        break :blk str_float == float;
+                    },
+                    .bool => |boolean| blk: {
+                        if (std.mem.eql(u8, actual_value, "true")) {
+                            break :blk boolean;
+                        } else if (std.mem.eql(u8, actual_value, "false")) {
+                            break :blk !boolean;
+                        }
+                        break :blk false;
+                    },
+                    else => false,
+                };
+
+                if (values_match) {
+                    matched_count += 1;
+                    if (!match_all) {
+                        return true; // For "any" match, one match is enough
+                    }
+                }
+            }
+        }
+
+        // For "all" match, all headers must match
+        if (match_all) {
+            return matched_count == required_count and required_count > 0;
+        }
+
+        // For "any" match, at least one header must match
+        return matched_count > 0;
     }
 
     pub fn getBindingCount(self: *const Exchange) u32 {
@@ -383,4 +461,53 @@ test "exchange binding arguments matching" {
     // Unbind with correct arguments should succeed
     try exchange.unbindQueue("queue3", "key1", "args2");
     try std.testing.expectEqual(@as(u32, 0), exchange.getBindingCount());
+}
+
+test "headers exchange matching" {
+    const allocator = std.testing.allocator;
+
+    var headers_exchange = try Exchange.init(allocator, "test", .headers, true, false, false, null);
+    defer headers_exchange.deinit();
+
+    // Create test message with headers
+    var message = try Message.init(allocator, 1, "test", "test.key", "test body");
+    defer message.deinit();
+
+    // Set up message headers
+    message.headers = HeaderTable.init(allocator);
+    try message.headers.?.put("type", "order");
+    try message.headers.?.put("priority", "high");
+    try message.headers.?.put("region", "us-east");
+    defer if (message.headers) |*headers| headers.deinit();
+
+    // Test "all" matching (default)
+    const all_args = "{\"x-match\":\"all\",\"type\":\"order\",\"priority\":\"high\"}";
+    try headers_exchange.bindQueue("queue1", "", all_args);
+
+    var matched = try headers_exchange.routeMessage(&message, allocator);
+    defer allocator.free(matched);
+    try std.testing.expectEqual(@as(usize, 1), matched.len);
+
+    // Test "any" matching
+    const any_args = "{\"x-match\":\"any\",\"type\":\"order\",\"status\":\"pending\"}";
+    try headers_exchange.bindQueue("queue2", "", any_args);
+
+    matched = try headers_exchange.routeMessage(&message, allocator);
+    defer allocator.free(matched);
+    try std.testing.expectEqual(@as(usize, 2), matched.len);
+
+    // Test no match (missing required header)
+    const no_match_args = "{\"x-match\":\"all\",\"type\":\"order\",\"missing\":\"value\"}";
+    try headers_exchange.bindQueue("queue3", "", no_match_args);
+
+    matched = try headers_exchange.routeMessage(&message, allocator);
+    defer allocator.free(matched);
+    try std.testing.expectEqual(@as(usize, 2), matched.len); // Still just queue1 and queue2
+
+    // Test null binding args (matches everything)
+    try headers_exchange.bindQueue("queue4", "", null);
+
+    matched = try headers_exchange.routeMessage(&message, allocator);
+    defer allocator.free(matched);
+    try std.testing.expectEqual(@as(usize, 3), matched.len);
 }
