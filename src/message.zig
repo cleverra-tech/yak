@@ -1,4 +1,5 @@
 const std = @import("std");
+const wombat = @import("wombat");
 
 pub const HeaderTable = std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage);
 
@@ -70,8 +71,9 @@ pub const Message = struct {
     first_death_exchange: ?[]const u8,
     max_delivery_count: ?u32,
 
-    // Wombat storage metadata
-    wombat_key: []const u8,
+    // Wombat storage metadata - for efficient large value storage
+    value_pointer: ?wombat.ValuePointer,
+    storage_key: []const u8, // Key used for storage in Wombat
 
     allocator: std.mem.Allocator,
 
@@ -95,7 +97,8 @@ pub const Message = struct {
             .first_death_reason = null,
             .first_death_exchange = null,
             .max_delivery_count = null,
-            .wombat_key = &[_]u8{},
+            .value_pointer = null,
+            .storage_key = &[_]u8{},
             .allocator = allocator,
         };
     }
@@ -114,8 +117,8 @@ pub const Message = struct {
             headers.deinit();
         }
 
-        if (self.wombat_key.len > 0) {
-            self.allocator.free(self.wombat_key);
+        if (self.storage_key.len > 0) {
+            self.allocator.free(self.storage_key);
         }
 
         // Clean up death events
@@ -226,7 +229,8 @@ pub const Message = struct {
             .first_death_reason = null,
             .first_death_exchange = null,
             .max_delivery_count = null,
-            .wombat_key = &[_]u8{},
+            .value_pointer = null,
+            .storage_key = &[_]u8{},
             .allocator = allocator,
         };
     }
@@ -456,6 +460,41 @@ pub const Message = struct {
             return value;
         }
         return null;
+    }
+
+    /// Sets the storage key for Wombat storage
+    pub fn setStorageKey(self: *Message, key: []const u8) !void {
+        if (self.storage_key.len > 0) {
+            self.allocator.free(self.storage_key);
+        }
+        self.storage_key = try self.allocator.dupe(u8, key);
+    }
+
+    /// Gets the storage key (returns empty slice if not set)
+    pub fn getStorageKey(self: *const Message) []const u8 {
+        return self.storage_key;
+    }
+
+    /// Sets a ValuePointer for efficient large value storage
+    /// This allows the message body to be stored separately in Wombat's value log
+    pub fn setValuePointer(self: *Message, vp: wombat.ValuePointer) void {
+        self.value_pointer = vp;
+    }
+
+    /// Gets the ValuePointer if set
+    pub fn getValuePointer(self: *const Message) ?wombat.ValuePointer {
+        return self.value_pointer;
+    }
+
+    /// Checks if this message uses ValuePointer storage for its body
+    pub fn hasValuePointer(self: *const Message) bool {
+        return self.value_pointer != null;
+    }
+
+    /// Creates a storage key for this message based on queue and message ID
+    pub fn generateStorageKey(self: *Message, queue_name: []const u8) !void {
+        const key = try std.fmt.allocPrint(self.allocator, "msg:{}:{}:{}", .{ queue_name, self.id, self.timestamp });
+        try self.setStorageKey(key);
     }
 };
 
