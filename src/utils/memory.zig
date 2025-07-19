@@ -259,15 +259,17 @@ pub const MemoryUtils = struct {
     }
 
     fn getWindowsMemoryUsage() !usize {
-        // Use tasklist command to get memory usage on Windows
+        // Use fixed buffer for pid filter instead of allocation
+        var pid_filter_buf: [64]u8 = undefined;
+        const pid_filter = try std.fmt.bufPrint(&pid_filter_buf, "pid eq {}", .{std.process.getpid()});
+
+        // Use a small arena for the subprocess call result
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        const allocator = arena.allocator();
-
-        const pid_filter = try std.fmt.allocPrint(allocator, "pid eq {}", .{std.process.getpid()});
+        const temp_allocator = arena.allocator();
 
         const result = std.process.Child.run(.{
-            .allocator = allocator,
+            .allocator = temp_allocator,
             .argv = &[_][]const u8{ "tasklist", "/fi", pid_filter, "/fo", "csv" },
         }) catch return error.MemoryInfoNotFound;
 
@@ -300,14 +302,17 @@ pub const MemoryUtils = struct {
     }
 
     fn getPSMemoryUsage() !usize {
+        // Use fixed buffer for pid string instead of allocation
+        var pid_buf: [32]u8 = undefined;
+        const pid_str = try std.fmt.bufPrint(&pid_buf, "{}", .{std.process.getpid()});
+
+        // Use a small arena for the subprocess call result
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        const allocator = arena.allocator();
-
-        const pid_str = try std.fmt.allocPrint(allocator, "{}", .{std.process.getpid()});
+        const temp_allocator = arena.allocator();
 
         const result = std.process.Child.run(.{
-            .allocator = allocator,
+            .allocator = temp_allocator,
             .argv = &[_][]const u8{ "ps", "-o", "rss=", "-p", pid_str },
         }) catch return error.MemoryInfoNotFound;
 
