@@ -336,7 +336,9 @@ pub const Queue = struct {
         var delivered_count: usize = 0;
         var consumer_index: usize = 0;
         var message_index: usize = 0;
-        const max_delivery_attempts = self.messages.items.len;
+        // Optimize max delivery attempts: limit to reasonable number based on consumers
+        // This prevents excessive loops when queues are large but consumers are at QoS limits
+        const max_delivery_attempts = @min(self.consumers.items.len * 2, 100);
 
         while (message_index < self.messages.items.len and delivered_count < max_delivery_attempts) {
             const consumer = &self.consumers.items[consumer_index % self.consumers.items.len];
