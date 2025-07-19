@@ -55,8 +55,6 @@ pub const MetadataStorage = struct {
 
         self.stats.exchanges_stored += 1;
         self.stats.metadata_operations += 1;
-
-        std.log.debug("Exchange metadata stored: {s}", .{exchange.name});
     }
 
     pub fn loadExchange(self: *MetadataStorage, exchange_name: []const u8) !?ExchangeMetadata {
@@ -94,7 +92,6 @@ pub const MetadataStorage = struct {
         };
 
         self.stats.metadata_operations += 1;
-        std.log.debug("Exchange metadata deleted: {s}", .{exchange_name});
     }
 
     pub fn listExchanges(self: *MetadataStorage) !std.ArrayList(ExchangeMetadata) {
@@ -155,8 +152,6 @@ pub const MetadataStorage = struct {
 
         self.stats.queues_stored += 1;
         self.stats.metadata_operations += 1;
-
-        std.log.debug("Queue metadata stored: {s}", .{queue.name});
     }
 
     pub fn loadQueue(self: *MetadataStorage, queue_name: []const u8) !?QueueMetadata {
@@ -194,7 +189,6 @@ pub const MetadataStorage = struct {
         };
 
         self.stats.metadata_operations += 1;
-        std.log.debug("Queue metadata deleted: {s}", .{queue_name});
     }
 
     pub fn listQueues(self: *MetadataStorage) !std.ArrayList(QueueMetadata) {
@@ -250,8 +244,6 @@ pub const MetadataStorage = struct {
 
         self.stats.bindings_stored += 1;
         self.stats.metadata_operations += 1;
-
-        std.log.debug("Binding stored: {s} -> {s} (key: {s})", .{ binding.exchange_name, binding.queue_name, binding.routing_key });
     }
 
     pub fn deleteBinding(self: *MetadataStorage, exchange_name: []const u8, queue_name: []const u8, routing_key: []const u8) !void {
@@ -264,7 +256,6 @@ pub const MetadataStorage = struct {
         };
 
         self.stats.metadata_operations += 1;
-        std.log.debug("Binding deleted: {s} -> {s} (key: {s})", .{ exchange_name, queue_name, routing_key });
     }
 
     pub fn listBindings(self: *MetadataStorage) !std.ArrayList(Binding) {
@@ -338,7 +329,6 @@ pub const MetadataStorage = struct {
         };
 
         self.stats.metadata_operations += 1;
-        std.log.debug("Server configuration stored");
     }
 
     pub fn loadServerConfig(self: *MetadataStorage, comptime T: type) !?T {

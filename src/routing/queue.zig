@@ -134,8 +134,6 @@ pub const Queue = struct {
         self.messages_ready += 1;
         self.memory_usage += message.body.len;
 
-        std.log.debug("Message published to queue {s}: {} bytes", .{ self.name, message.body.len });
-
         // Try to deliver to waiting consumers
         self.tryDeliverMessages();
     }
@@ -159,8 +157,6 @@ pub const Queue = struct {
         try self.consumers.append(consumer);
         self.consumers_total += 1;
 
-        std.log.debug("Consumer added to queue {s}: {s}", .{ self.name, consumer.tag });
-
         // Try to deliver existing messages
         self.tryDeliverMessages();
     }
@@ -173,7 +169,6 @@ pub const Queue = struct {
             if (std.mem.eql(u8, consumer.tag, consumer_tag)) {
                 var removed_consumer = self.consumers.swapRemove(i);
                 removed_consumer.deinit();
-                std.log.debug("Consumer cancelled from queue {s}: {s}", .{ self.name, consumer_tag });
                 return;
             }
         }
@@ -209,8 +204,6 @@ pub const Queue = struct {
                 }
             }
         }
-
-        std.log.debug("Message(s) acknowledged in queue {s}: delivery_tag={}", .{ self.name, delivery_tag });
     }
 
     pub fn reject(self: *Queue, delivery_tag: u64, requeue: bool) !void {
@@ -225,14 +218,12 @@ pub const Queue = struct {
                     message.incrementDeliveryCount();
                     self.messages_unacknowledged = @max(1, self.messages_unacknowledged) - 1;
                     self.messages_ready += 1;
-                    std.log.debug("Message requeued in queue {s}: delivery_tag={}", .{ self.name, delivery_tag });
                 } else {
                     // Drop the message
                     var rejected_message = self.messages.orderedRemove(i);
                     rejected_message.deinit();
                     self.messages_unacknowledged = @max(1, self.messages_unacknowledged) - 1;
                     self.memory_usage -= rejected_message.body.len;
-                    std.log.debug("Message rejected and dropped from queue {s}: delivery_tag={}", .{ self.name, delivery_tag });
                 }
                 return;
             }
@@ -268,7 +259,6 @@ pub const Queue = struct {
             self.memory_usage -= message.body.len;
         }
 
-        std.log.debug("Message retrieved from queue {s}: {} bytes (no_ack={})", .{ self.name, message.body.len, no_ack });
         return message;
     }
 
@@ -287,7 +277,6 @@ pub const Queue = struct {
         self.messages_unacknowledged = 0;
         self.memory_usage = 0;
 
-        std.log.debug("Queue purged: {s} ({} messages)", .{ self.name, message_count });
         return message_count;
     }
 
@@ -370,7 +359,6 @@ pub const Queue = struct {
                 }
 
                 delivered_count += 1;
-                std.log.debug("Message delivered to consumer {s} from queue {s}", .{ consumer.tag, self.name });
             } else {
                 message_index += 1;
             }
@@ -516,14 +504,12 @@ pub const Queue = struct {
 
                             self.messages_unacknowledged = @max(1, self.messages_unacknowledged) - 1;
                             self.memory_usage -= rejected_message.body.len;
-                            std.log.debug("Message dead lettered due to delivery count in queue {s}: delivery_tag={}", .{ self.name, delivery_tag });
                             return;
                         }
                     }
 
                     self.messages_unacknowledged = @max(1, self.messages_unacknowledged) - 1;
                     self.messages_ready += 1;
-                    std.log.debug("Message requeued in queue {s}: delivery_tag={}", .{ self.name, delivery_tag });
                 } else {
                     // Dead letter the message if configured
                     if (self.dead_letter_exchange != null) {
@@ -538,14 +524,12 @@ pub const Queue = struct {
 
                         self.messages_unacknowledged = @max(1, self.messages_unacknowledged) - 1;
                         self.memory_usage -= rejected_message.body.len;
-                        std.log.debug("Message dead lettered from queue {s}: delivery_tag={}", .{ self.name, delivery_tag });
                     } else {
                         // Drop the message
                         var rejected_message = self.messages.orderedRemove(i);
                         rejected_message.deinit();
                         self.messages_unacknowledged = @max(1, self.messages_unacknowledged) - 1;
                         self.memory_usage -= rejected_message.body.len;
-                        std.log.debug("Message rejected and dropped from queue {s}: delivery_tag={}", .{ self.name, delivery_tag });
                     }
                 }
                 return;
@@ -577,14 +561,12 @@ pub const Queue = struct {
 
                     self.messages_ready = @max(1, self.messages_ready) - 1;
                     self.memory_usage -= oldest_message.body.len;
-                    std.log.debug("Message dead lettered due to queue length limit in queue {s}", .{self.name});
                 } else {
                     // Drop oldest message (head drop policy)
                     var oldest_message = self.messages.orderedRemove(0);
                     oldest_message.deinit();
                     self.messages_ready = @max(1, self.messages_ready) - 1;
                     self.memory_usage -= oldest_message.body.len;
-                    std.log.debug("Oldest message dropped due to queue length limit in queue {s}", .{self.name});
                 }
             }
         }
@@ -599,8 +581,6 @@ pub const Queue = struct {
         self.messages_total += 1;
         self.messages_ready += 1;
         self.memory_usage += new_message.body.len;
-
-        std.log.debug("Message published to queue {s}: {} bytes", .{ self.name, new_message.body.len });
 
         // Try to deliver to consumers
         self.tryDeliverMessages();

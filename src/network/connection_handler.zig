@@ -63,7 +63,6 @@ pub const ConnectionHandler = struct {
         _ = self;
         const protocol_header = "AMQP\x00\x00\x09\x01";
         try connection.socket.writeAll(protocol_header);
-        std.log.debug("Protocol header sent to connection {}", .{connection.id});
     }
 
     pub fn sendConnectionStart(self: *ConnectionHandler, connection: *Connection) !void {
@@ -105,7 +104,6 @@ pub const ConnectionHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Connection.Start sent to connection {}", .{connection.id});
     }
 
     pub fn handleConnectionStartOk(self: *ConnectionHandler, connection: *Connection, payload: []const u8) !void {
@@ -279,7 +277,7 @@ pub const ConnectionHandler = struct {
         if (client_properties.count() > 0) {
             var prop_iter = client_properties.iterator();
             while (prop_iter.next()) |entry| {
-                std.log.debug("Client property: {s} = {s}", .{ entry.key_ptr.*, entry.value_ptr.* });
+                _ = entry;
             }
         }
 
@@ -288,8 +286,6 @@ pub const ConnectionHandler = struct {
         // Send Connection.Tune
         try self.sendConnectionTune(connection);
         connection.setState(.tune_sent);
-
-        std.log.debug("Connection.StartOk handled for connection {}", .{connection.id});
     }
 
     pub fn sendConnectionTune(self: *ConnectionHandler, connection: *Connection) !void {
@@ -316,7 +312,6 @@ pub const ConnectionHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Connection.Tune sent to connection {}", .{connection.id});
     }
 
     pub fn handleConnectionTuneOk(self: *ConnectionHandler, connection: *Connection, payload: []const u8) !void {
@@ -336,7 +331,6 @@ pub const ConnectionHandler = struct {
         connection.heartbeat_interval = heartbeat;
 
         connection.setState(.tune_ok_received);
-        std.log.debug("Connection.TuneOk handled for connection {}: channel_max={}, frame_max={}, heartbeat={}", .{ connection.id, channel_max, frame_max, heartbeat });
     }
 
     pub fn handleConnectionOpen(self: *ConnectionHandler, connection: *Connection, payload: []const u8) !void {
@@ -383,7 +377,6 @@ pub const ConnectionHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Connection.OpenOk sent to connection {}", .{connection.id});
     }
 
     pub fn handleConnectionClose(self: *ConnectionHandler, connection: *Connection, payload: []const u8) !void {
@@ -469,8 +462,6 @@ pub const ConnectionHandler = struct {
         // Send Connection.CloseOk
         try self.sendConnectionCloseOk(connection);
         connection.setState(.closed);
-
-        std.log.debug("Connection.Close handled for connection {}", .{connection.id});
     }
 
     pub fn sendConnectionCloseOk(self: *ConnectionHandler, connection: *Connection) !void {
@@ -490,7 +481,6 @@ pub const ConnectionHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Connection.CloseOk sent to connection {}", .{connection.id});
     }
 };
 

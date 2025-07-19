@@ -145,15 +145,11 @@ pub const ProtocolHandler = struct {
             .method => try self.handleMethodFrame(connection, frame),
             .header => {
                 // Header frames are handled in context of pending messages
-                std.log.debug("Received content header frame on channel {} for connection {}", .{ frame.channel_id, connection.id });
             },
             .body => {
                 // Body frames are handled in context of pending messages
-                std.log.debug("Received content body frame on channel {} for connection {}", .{ frame.channel_id, connection.id });
             },
-            .heartbeat => {
-                std.log.debug("Received heartbeat frame from connection {}", .{connection.id});
-            },
+            .heartbeat => {},
         }
     }
 

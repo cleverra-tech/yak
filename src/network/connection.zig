@@ -339,8 +339,6 @@ pub const Connection = struct {
         const channel = try self.allocator.create(Channel);
         channel.* = Channel.init(self.allocator, channel_id, self.id);
         try self.channels.put(channel_id, channel);
-
-        std.log.debug("Channel {} created for connection {}", .{ channel_id, self.id });
     }
 
     pub fn removeChannel(self: *Connection, channel_id: u16) void {
@@ -350,7 +348,6 @@ pub const Connection = struct {
         if (self.channels.fetchRemove(channel_id)) |entry| {
             entry.value.deinit();
             self.allocator.destroy(entry.value);
-            std.log.debug("Channel {} removed from connection {}", .{ channel_id, self.id });
         }
     }
 
@@ -362,7 +359,6 @@ pub const Connection = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        std.log.debug("Connection {} state change: {} -> {}", .{ self.id, self.state, new_state });
         self.state = new_state;
     }
 
@@ -387,15 +383,12 @@ pub const Connection = struct {
         if (bytes_written != encoded_frame.len) {
             return error.PartialWrite;
         }
-
-        std.log.debug("Frame sent on connection {}: type={}, channel={}, size={}", .{ self.id, frame.frame_type, frame.channel_id, bytes_written });
     }
 
     pub fn receiveFrame(self: *Connection) !?Frame {
         // Read frame header first (8 bytes: type + channel + size + end)
         var header_buf: [8]u8 = undefined;
-        const header_bytes = self.socket.read(&header_buf) catch |err| {
-            std.log.debug("Connection {} read error: {}", .{ self.id, err });
+        const header_bytes = self.socket.read(&header_buf) catch {
             return null;
         };
 
@@ -440,8 +433,6 @@ pub const Connection = struct {
             .payload = try self.allocator.dupe(u8, payload),
         };
 
-        std.log.debug("Frame received on connection {}: type={}, channel={}, size={}", .{ self.id, frame_type, channel, payload_size });
-
         return frame;
     }
 
@@ -454,8 +445,6 @@ pub const Connection = struct {
 
         try self.sendFrame(heartbeat_frame);
         self.last_heartbeat = std.time.timestamp();
-
-        std.log.debug("Heartbeat sent on connection {}", .{self.id});
     }
 
     pub fn checkHeartbeat(self: *Connection) bool {
@@ -484,7 +473,6 @@ pub const Connection = struct {
         }
 
         self.virtual_host = try self.allocator.dupe(u8, vhost_name);
-        std.log.debug("Connection {} virtual host set to: {s}", .{ self.id, vhost_name });
     }
 
     pub fn getStats(self: *const Connection, allocator: std.mem.Allocator) !std.json.Value {

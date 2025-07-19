@@ -104,7 +104,7 @@ pub const Server = struct {
 
         // Create default virtual host
         try server.createVirtualHost("/");
-        
+
         // Set server reference for default virtual host for cluster operations
         if (server.getVirtualHost("/")) |default_vhost| {
             default_vhost.setServerReference(&server);
@@ -346,8 +346,6 @@ pub const Server = struct {
     }
 
     fn cliServerThread(self: *Server) void {
-        std.log.debug("CLI server thread started", .{});
-
         if (self.cli_server == null) {
             std.log.err("CLI server not initialized when starting thread", .{});
             return;
@@ -403,12 +401,8 @@ pub const Server = struct {
 
                 // Detach the thread so it can clean up itself
                 thread.detach();
-
-                std.log.debug("Spawned CLI client thread for client {}", .{client_id});
             }
         }
-
-        std.log.debug("CLI server thread shutting down", .{});
     }
 
     fn acceptCliConnectionWithTimeout(self: *Server, timeout_ms: u32) !?std.net.Server.Connection {
@@ -436,7 +430,6 @@ pub const Server = struct {
     }
 
     fn handleCliConnection(self: *Server, connection: std.net.Server.Connection) !void {
-        std.log.debug("Processing CLI client connection", .{});
 
         // TODO: For now, send a simple welcome message and close
         // This will be expanded with actual CLI protocol handling
@@ -1403,7 +1396,7 @@ pub const Server = struct {
         const owned_name = try self.allocator.dupe(u8, name);
         const vhost = try self.allocator.create(VirtualHost);
         vhost.* = try VirtualHost.init(self.allocator, owned_name);
-        
+
         // Set server reference for cluster operations
         vhost.setServerReference(self);
 
@@ -1503,7 +1496,6 @@ pub const Server = struct {
         // Try to open vhost directory
         var dir = std.fs.cwd().openDir(vhost_dir, .{}) catch |err| switch (err) {
             error.FileNotFound => {
-                std.log.debug("No persistent data found for vhost {s}", .{vhost.name});
                 return;
             },
             else => return err,
@@ -1526,7 +1518,6 @@ pub const Server = struct {
 
         const file = vhost_dir.openFile(queue_file, .{}) catch |err| switch (err) {
             error.FileNotFound => {
-                std.log.debug("No persistent messages found for queue {s}", .{queue.name});
                 return;
             },
             else => return err,
@@ -1633,8 +1624,6 @@ pub const Server = struct {
         try file.seekTo(0);
         std.mem.writeInt(u32, &buffer, current_count, .little);
         try file.writeAll(&buffer);
-
-        std.log.debug("Persisted message {} to queue {s} in vhost {s}", .{ message.id, queue_name, vhost_name });
     }
 
     pub fn persistQueueState(self: *Server, vhost_name: []const u8, queue: *const Queue) !void {
@@ -1681,16 +1670,12 @@ pub const Server = struct {
                 try file.writeAll(encoded);
             }
         }
-
-        std.log.debug("Persisted {} messages for durable queue {s} in vhost {s}", .{ persistent_count, queue.name, vhost_name });
     }
 
     /// Periodic maintenance for error handler
     pub fn performMaintenance(self: *Server) void {
         // Clear old errors (older than 1 hour)
         self.error_handler.clearOldErrors(3600);
-
-        std.log.debug("Performed server maintenance: cleared old errors", .{});
     }
 
     /// Initialize metrics collection and HTTP server

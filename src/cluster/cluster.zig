@@ -24,7 +24,9 @@ pub const NodeInfo = struct {
     version: ClusterVersion,
 
     pub fn deinit(self: *NodeInfo, allocator: std.mem.Allocator) void {
-        allocator.free(self.address);
+        if (self.address.len > 0) {
+            allocator.free(self.address);
+        }
     }
 };
 
@@ -50,7 +52,6 @@ pub const ClusterMessage = struct {
         allocator.free(self.data);
     }
 };
-
 
 pub const Cluster = struct {
     allocator: std.mem.Allocator,
@@ -126,7 +127,7 @@ pub const Cluster = struct {
         if (!self.config.enabled) return;
 
         self.stop();
-        
+
         // Clean up nodes
         var iterator = self.nodes.valueIterator();
         while (iterator.next()) |node| {
@@ -295,7 +296,7 @@ pub const Cluster = struct {
         }
 
         if (replicated_count > 0) {
-            std.log.debug("Replicated message {} to {} cluster nodes", .{ message.id, replicated_count });
+            std.log.info("Replicated message {} to {} cluster nodes", .{ message.id, replicated_count });
         }
     }
 
@@ -357,7 +358,7 @@ pub const Cluster = struct {
         while (self.running.load(.monotonic)) {
             const message = self.receiveMessage(connection.stream) catch |err| {
                 if (self.running.load(.monotonic)) {
-                    std.log.debug("Connection receive error: {}", .{err});
+                    std.log.warn("Connection receive error: {}", .{err});
                 }
                 break;
             };
@@ -486,8 +487,6 @@ pub const Cluster = struct {
         self.vhost_ref.?.routeMessage(repl_data.value.exchange, &replicated_message) catch |err| {
             std.log.warn("Failed to route replicated message: {}", .{err});
         };
-
-        std.log.debug("Processed replicated message {} from node {}", .{ repl_data.value.message_id, message.source_node });
     }
 
     fn handleLeaderElection(self: *Cluster, message: ClusterMessage) !void {
@@ -501,10 +500,10 @@ pub const Cluster = struct {
     fn handleLeaderAnnouncement(self: *Cluster, message: ClusterMessage) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        
+
         self.leader_node = message.source_node;
         self.is_leader = (message.source_node == self.local_node.id);
-        
+
         std.log.info("Node {} is now the cluster leader", .{message.source_node});
     }
 
@@ -528,7 +527,7 @@ pub const Cluster = struct {
         var conn_iterator = self.client_connections.valueIterator();
         while (conn_iterator.next()) |stream| {
             self.sendMessage(stream.*, heartbeat) catch |err| {
-                std.log.debug("Failed to send heartbeat: {}", .{err});
+                std.log.warn("Failed to send heartbeat: {}", .{err});
             };
         }
     }

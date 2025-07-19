@@ -123,7 +123,6 @@ pub const CliServer = struct {
         var buffer: [4096]u8 = undefined;
         while (self.running) {
             const bytes_read = client.stream.read(&buffer) catch |err| {
-                std.log.debug("CLI client {} disconnected: {}", .{ client.id, err });
                 break;
             };
 

@@ -37,8 +37,6 @@ pub const ChannelHandler = struct {
 
         // Send Channel.OpenOk
         try self.sendChannelOpenOk(connection, channel_id);
-
-        std.log.debug("Channel {} opened on connection {}", .{ channel_id, connection.id });
     }
 
     pub fn sendChannelOpenOk(self: *ChannelHandler, connection: *Connection, channel_id: u16) !void {
@@ -61,7 +59,6 @@ pub const ChannelHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Channel.OpenOk sent to channel {} on connection {}", .{ channel_id, connection.id });
     }
 
     pub fn handleChannelFlow(self: *ChannelHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -88,8 +85,6 @@ pub const ChannelHandler = struct {
 
         // Send Channel.FlowOk
         try self.sendChannelFlowOk(connection, channel_id, active);
-
-        std.log.debug("Channel {} flow set to {} on connection {}", .{ channel_id, active, connection.id });
     }
 
     pub fn sendChannelFlowOk(self: *ChannelHandler, connection: *Connection, channel_id: u16, active: bool) !void {
@@ -112,7 +107,6 @@ pub const ChannelHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Channel.FlowOk sent to channel {} on connection {}: active={}", .{ channel_id, connection.id, active });
     }
 
     pub fn handleChannelClose(self: *ChannelHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -122,8 +116,6 @@ pub const ChannelHandler = struct {
 
         // Send Channel.CloseOk
         try self.sendChannelCloseOk(connection, channel_id);
-
-        std.log.debug("Channel {} closed on connection {}", .{ channel_id, connection.id });
     }
 
     pub fn sendChannelCloseOk(self: *ChannelHandler, connection: *Connection, channel_id: u16) !void {
@@ -143,7 +135,6 @@ pub const ChannelHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Channel.CloseOk sent to channel {} on connection {}", .{ channel_id, connection.id });
     }
 };
 

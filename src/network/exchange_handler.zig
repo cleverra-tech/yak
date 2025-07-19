@@ -183,8 +183,6 @@ pub const ExchangeHandler = struct {
         if (!no_wait) {
             try self.sendExchangeDeclareOk(connection, channel_id);
         }
-
-        std.log.debug("Exchange.Declare handled for connection {}, channel {}: {s}", .{ connection.id, channel_id, exchange_name });
     }
 
     pub fn sendExchangeDeclareOk(self: *ExchangeHandler, connection: *Connection, channel_id: u16) !void {
@@ -204,7 +202,6 @@ pub const ExchangeHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Exchange.DeclareOk sent to channel {} on connection {}", .{ channel_id, connection.id });
     }
 
     pub fn handleExchangeDelete(self: *ExchangeHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -279,8 +276,6 @@ pub const ExchangeHandler = struct {
         if (!no_wait) {
             try self.sendExchangeDeleteOk(connection, channel_id);
         }
-
-        std.log.debug("Exchange.Delete handled for connection {}, channel {}: {s}", .{ connection.id, channel_id, exchange_name });
     }
 
     pub fn sendExchangeDeleteOk(self: *ExchangeHandler, connection: *Connection, channel_id: u16) !void {
@@ -300,7 +295,6 @@ pub const ExchangeHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Exchange.DeleteOk sent to channel {} on connection {}", .{ channel_id, connection.id });
     }
 
     pub fn handleExchangeBind(self: *ExchangeHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -466,7 +460,6 @@ pub const ExchangeHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Exchange.BindOk sent to channel {} on connection {}", .{ channel_id, connection.id });
     }
 
     pub fn handleExchangeUnbind(self: *ExchangeHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -632,7 +625,6 @@ pub const ExchangeHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Exchange.UnbindOk sent to channel {} on connection {}", .{ channel_id, connection.id });
     }
 };
 

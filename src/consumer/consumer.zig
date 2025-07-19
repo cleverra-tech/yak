@@ -106,11 +106,10 @@ pub const Consumer = struct {
             self.unacked_messages += 1;
             self.unacked_size += @intCast(message.body.len);
         }
-
-        std.log.debug("Message delivered to consumer {s}: {} bytes", .{ self.tag, message.body.len });
     }
 
     pub fn acknowledge(self: *Consumer, delivery_tag: u64, multiple: bool) void {
+        _ = delivery_tag;
         if (multiple) {
             // For simplicity, just reset all unacked counters
             // In a real implementation, we'd track individual messages
@@ -125,30 +124,26 @@ pub const Consumer = struct {
                 self.unacked_size = if (self.unacked_size > 0) self.unacked_size - 1 else 0;
             }
         }
-
-        std.log.debug("Message acknowledged by consumer {s}: delivery_tag={}, multiple={}", .{ self.tag, delivery_tag, multiple });
     }
 
     pub fn reject(self: *Consumer, delivery_tag: u64, requeue: bool) void {
+        _ = delivery_tag;
+        _ = requeue;
         if (self.unacked_messages > 0) {
             self.unacked_messages -= 1;
             self.messages_rejected += 1;
             self.unacked_size = if (self.unacked_size > 0) self.unacked_size - 1 else 0;
         }
-
-        std.log.debug("Message rejected by consumer {s}: delivery_tag={}, requeue={}", .{ self.tag, delivery_tag, requeue });
     }
 
     pub fn cancel(self: *Consumer) void {
         self.cancelled = true;
         self.active = false;
-        std.log.debug("Consumer cancelled: {s}", .{self.tag});
     }
 
     pub fn setQoS(self: *Consumer, prefetch_count: u16, prefetch_size: u32) void {
         self.prefetch_count = prefetch_count;
         self.prefetch_size = prefetch_size;
-        std.log.debug("QoS set for consumer {s}: prefetch_count={}, prefetch_size={}", .{ self.tag, prefetch_count, prefetch_size });
     }
 
     pub fn getDeliveryMode(self: *const Consumer) DeliveryMode {
@@ -268,8 +263,6 @@ pub const ConsumerRegistry = struct {
             result.value_ptr.* = std.ArrayList(*Consumer).init(self.allocator);
         }
         try result.value_ptr.append(consumer_ptr);
-
-        std.log.debug("Consumer registered: {s} -> {s}", .{ consumer.tag, consumer.queue_name });
     }
 
     pub fn removeConsumer(self: *ConsumerRegistry, consumer_tag: []const u8) !void {
@@ -298,8 +291,6 @@ pub const ConsumerRegistry = struct {
             self.allocator.destroy(entry.value);
             self.allocator.free(entry.key);
         }
-
-        std.log.debug("Consumer unregistered: {s}", .{consumer_tag});
     }
 
     pub fn getConsumer(self: *ConsumerRegistry, consumer_tag: []const u8) ?*Consumer {

@@ -46,8 +46,6 @@ pub const MessageStorage = struct {
 
         self.stats.messages_stored += 1;
         self.stats.bytes_stored += encoded_message.len;
-
-        std.log.debug("Message stored: queue={s}, id={}, size={} bytes", .{ queue_name, message.id, encoded_message.len });
     }
 
     pub fn loadMessage(self: *MessageStorage, queue_name: []const u8, message_id: u64) !?Message {
@@ -70,7 +68,6 @@ pub const MessageStorage = struct {
             self.stats.messages_retrieved += 1;
             self.stats.bytes_retrieved += data.len;
 
-            std.log.debug("Message loaded: queue={s}, id={}, size={} bytes", .{ queue_name, message_id, data.len });
             return message;
         }
 
@@ -87,7 +84,6 @@ pub const MessageStorage = struct {
         };
 
         self.stats.messages_deleted += 1;
-        std.log.debug("Message deleted: queue={s}, id={}", .{ queue_name, message_id });
     }
 
     pub fn storeMessageBatch(self: *MessageStorage, queue_name: []const u8, messages: []const Message) !void {
@@ -119,7 +115,6 @@ pub const MessageStorage = struct {
         };
 
         self.stats.messages_stored += messages.len;
-        std.log.debug("Message batch stored: queue={s}, count={}", .{ queue_name, messages.len });
     }
 
     pub fn loadMessageBatch(self: *MessageStorage, queue_name: []const u8, message_ids: []const u64) !std.ArrayList(Message) {
@@ -174,7 +169,6 @@ pub const MessageStorage = struct {
         }
 
         self.stats.messages_retrieved += messages.items.len;
-        std.log.debug("Message batch loaded: queue={s}, found={}/{}", .{ queue_name, messages.items.len, message_ids.len });
 
         return messages;
     }
@@ -201,7 +195,6 @@ pub const MessageStorage = struct {
         };
 
         self.stats.messages_deleted += message_ids.len;
-        std.log.debug("Message batch deleted: queue={s}, count={}", .{ queue_name, message_ids.len });
     }
 
     pub fn getQueueMessages(self: *MessageStorage, queue_name: []const u8) !std.ArrayList(Message) {
@@ -231,7 +224,6 @@ pub const MessageStorage = struct {
         }
 
         self.stats.messages_retrieved += messages.items.len;
-        std.log.debug("Queue messages loaded: queue={s}, count={}", .{ queue_name, messages.items.len });
 
         return messages;
     }
@@ -269,7 +261,6 @@ pub const MessageStorage = struct {
 
         const deleted_count = @as(u32, @intCast(keys.items.len));
         self.stats.messages_deleted += deleted_count;
-        std.log.debug("Queue messages deleted: queue={s}, count={}", .{ queue_name, deleted_count });
 
         return deleted_count;
     }

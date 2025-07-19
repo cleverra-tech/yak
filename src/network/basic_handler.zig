@@ -66,6 +66,7 @@ pub const BasicHandler = struct {
         }
 
         const exchange_name = payload[offset .. offset + exchange_name_len];
+        _ = exchange_name;
         offset += exchange_name_len;
 
         // Parse routing key (short string)
@@ -89,6 +90,7 @@ pub const BasicHandler = struct {
         }
 
         const routing_key = payload[offset .. offset + routing_key_len];
+        _ = routing_key;
         offset += routing_key_len;
 
         // Parse flags (1 byte: mandatory, immediate)
@@ -121,7 +123,6 @@ pub const BasicHandler = struct {
         // TODO: For now, just acknowledge the publish command without implementing full message routing
         // This would need content header and body frame handling
 
-        std.log.debug("Basic.Publish handled for connection {}, channel {}: {s} -> {s}", .{ connection.id, channel_id, exchange_name, routing_key });
     }
 
     pub fn handleBasicConsume(self: *BasicHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -158,6 +159,7 @@ pub const BasicHandler = struct {
         }
 
         const queue_name = payload[offset .. offset + queue_name_len];
+        _ = queue_name;
         offset += queue_name_len;
 
         // Parse consumer tag (short string)
@@ -251,8 +253,6 @@ pub const BasicHandler = struct {
         if (!no_wait) {
             try self.sendBasicConsumeOk(connection, channel_id, consumer_tag);
         }
-
-        std.log.debug("Basic.Consume handled for connection {}, channel {}: {s} (tag: {s})", .{ connection.id, channel_id, queue_name, consumer_tag });
     }
 
     pub fn sendBasicConsumeOk(self: *BasicHandler, connection: *Connection, channel_id: u16, consumer_tag: []const u8) !void {
@@ -276,7 +276,6 @@ pub const BasicHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Basic.ConsumeOk sent to channel {} on connection {}: {s}", .{ channel_id, connection.id, consumer_tag });
     }
 
     pub fn handleBasicCancel(self: *BasicHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -334,8 +333,6 @@ pub const BasicHandler = struct {
         if (!no_wait) {
             try self.sendBasicCancelOk(connection, channel_id, consumer_tag);
         }
-
-        std.log.debug("Basic.Cancel handled for connection {}, channel {}: {s}", .{ connection.id, channel_id, consumer_tag });
     }
 
     pub fn sendBasicCancelOk(self: *BasicHandler, connection: *Connection, channel_id: u16, consumer_tag: []const u8) !void {
@@ -359,7 +356,6 @@ pub const BasicHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Basic.CancelOk sent to channel {} on connection {}: {s}", .{ channel_id, connection.id, consumer_tag });
     }
 
     pub fn handleBasicGet(self: *BasicHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -396,6 +392,7 @@ pub const BasicHandler = struct {
         }
 
         const queue_name = payload[offset .. offset + queue_name_len];
+        _ = queue_name;
         offset += queue_name_len;
 
         // Parse no-ack flag (1 byte)
@@ -424,8 +421,6 @@ pub const BasicHandler = struct {
 
         // TODO: For now, always return empty (no messages available)
         try self.sendBasicGetEmpty(connection, channel_id);
-
-        std.log.debug("Basic.Get handled for connection {}, channel {}: {s}", .{ connection.id, channel_id, queue_name });
     }
 
     pub fn sendBasicGetOk(self: *BasicHandler, connection: *Connection, channel_id: u16, delivery_tag: u64, redelivered: bool, exchange_name: []const u8, routing_key: []const u8, message_count: u32) !void {
@@ -462,7 +457,6 @@ pub const BasicHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Basic.GetOk sent to channel {} on connection {}", .{ channel_id, connection.id });
     }
 
     pub fn sendBasicGetEmpty(self: *BasicHandler, connection: *Connection, channel_id: u16) !void {
@@ -485,7 +479,6 @@ pub const BasicHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Basic.GetEmpty sent to channel {} on connection {}", .{ channel_id, connection.id });
     }
 
     pub fn handleBasicAck(self: *BasicHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -498,7 +491,9 @@ pub const BasicHandler = struct {
         }
 
         const delivery_tag = std.mem.readInt(u64, payload[0..8], .big);
+        _ = delivery_tag;
         const multiple = payload[8] != 0;
+        _ = multiple;
 
         // Get virtual host
         const vhost = if (self.get_vhost_fn) |get_vhost| get_vhost(connection.virtual_host orelse "/") else null;
@@ -514,7 +509,6 @@ pub const BasicHandler = struct {
 
         // TODO: For now, just acknowledge the ack command
 
-        std.log.debug("Basic.Ack handled for connection {}, channel {}: delivery_tag={}, multiple={}", .{ connection.id, channel_id, delivery_tag, multiple });
     }
 
     pub fn handleBasicNack(self: *BasicHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -527,8 +521,11 @@ pub const BasicHandler = struct {
         }
 
         const delivery_tag = std.mem.readInt(u64, payload[0..8], .big);
+        _ = delivery_tag;
         const multiple = payload[8] != 0;
+        _ = multiple;
         const requeue = payload[9] != 0;
+        _ = requeue;
 
         // Get virtual host
         const vhost = if (self.get_vhost_fn) |get_vhost| get_vhost(connection.virtual_host orelse "/") else null;
@@ -545,7 +542,6 @@ pub const BasicHandler = struct {
         // the message(s) came from based on the delivery tag(s) and channel state
         // For now, we'll log the nack
 
-        std.log.debug("Basic.Nack handled for connection {}, channel {}: delivery_tag={}, multiple={}, requeue={}", .{ connection.id, channel_id, delivery_tag, multiple, requeue });
     }
 
     pub fn handleBasicReject(self: *BasicHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -558,7 +554,9 @@ pub const BasicHandler = struct {
         }
 
         const delivery_tag = std.mem.readInt(u64, payload[0..8], .big);
+        _ = delivery_tag;
         const requeue = payload[8] != 0;
+        _ = requeue;
 
         // Get virtual host
         const vhost = if (self.get_vhost_fn) |get_vhost| get_vhost(connection.virtual_host orelse "/") else null;
@@ -575,7 +573,6 @@ pub const BasicHandler = struct {
         // the message came from based on the delivery tag and channel state
         // For now, we'll log the rejection
 
-        std.log.debug("Basic.Reject handled for connection {}, channel {}: delivery_tag={}, requeue={}", .{ connection.id, channel_id, delivery_tag, requeue });
     }
 
     pub fn handleBasicRecover(self: *BasicHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -588,6 +585,7 @@ pub const BasicHandler = struct {
         }
 
         const requeue = payload[0] != 0;
+        _ = requeue;
 
         // Get virtual host
         const vhost = if (self.get_vhost_fn) |get_vhost| get_vhost(connection.virtual_host orelse "/") else null;
@@ -605,8 +603,6 @@ pub const BasicHandler = struct {
 
         // Send Basic.RecoverOk
         try self.sendBasicRecoverOk(connection, channel_id);
-
-        std.log.debug("Basic.Recover handled for connection {}, channel {}: requeue={}", .{ connection.id, channel_id, requeue });
     }
 
     pub fn sendBasicRecoverOk(self: *BasicHandler, connection: *Connection, channel_id: u16) !void {
@@ -626,7 +622,6 @@ pub const BasicHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Basic.RecoverOk sent to channel {} on connection {}", .{ channel_id, connection.id });
     }
 };
 

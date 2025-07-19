@@ -109,8 +109,6 @@ pub const Exchange = struct {
         if (self.exchange_type == .direct) {
             try self.updateDirectRoutingMap(routing_key, queue_name, true);
         }
-
-        std.log.debug("Binding added: {s} -> {s} (key: {s})", .{ self.name, queue_name, routing_key });
     }
 
     pub fn unbindQueue(
@@ -132,7 +130,6 @@ pub const Exchange = struct {
                 }
 
                 removed_binding.deinit();
-                std.log.debug("Binding removed: {s} -/-> {s} (key: {s})", .{ self.name, queue_name, routing_key });
                 return;
             }
         }

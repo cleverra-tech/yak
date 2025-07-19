@@ -178,7 +178,6 @@ pub const QoSManager = struct {
         if (global) {
             self.global_prefetch_count = prefetch_count;
             self.global_prefetch_size = prefetch_size;
-            std.log.debug("Global QoS set: prefetch_count={}, prefetch_size={}", .{ prefetch_count, prefetch_size });
         } else {
             try self.channel_qos.put(channel_id, ChannelQoS{
                 .prefetch_count = prefetch_count,
@@ -187,7 +186,6 @@ pub const QoSManager = struct {
                 .unacked_size = 0,
                 .global = false,
             });
-            std.log.debug("Channel QoS set for channel {}: prefetch_count={}, prefetch_size={}", .{ channel_id, prefetch_count, prefetch_size });
         }
     }
 
@@ -202,8 +200,6 @@ pub const QoSManager = struct {
 
         result.value_ptr.prefetch_count = prefetch_count;
         result.value_ptr.prefetch_size = prefetch_size;
-
-        std.log.debug("Connection QoS set for connection {}: prefetch_count={}, prefetch_size={}", .{ connection_id, prefetch_count, prefetch_size });
     }
 
     pub fn setConsumerQoS(
@@ -226,8 +222,6 @@ pub const QoSManager = struct {
             .channel_id = channel_id,
             .connection_id = connection_id,
         });
-
-        std.log.debug("Consumer QoS set for {s}: prefetch_count={}, prefetch_size={}", .{ consumer_tag, prefetch_count, prefetch_size });
     }
 
     pub fn messageDelivered(self: *QoSManager, channel_id: u16, connection_id: u64, consumer_tag: ?[]const u8, message_size: u32) void {

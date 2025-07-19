@@ -158,8 +158,6 @@ pub const QueueHandler = struct {
         if (!no_wait) {
             try self.sendQueueDeclareOk(connection, channel_id, queue_name, message_count, consumer_count);
         }
-
-        std.log.debug("Queue.Declare handled for connection {}, channel {}: {s}", .{ connection.id, channel_id, queue_name });
     }
 
     pub fn sendQueueDeclareOk(self: *QueueHandler, connection: *Connection, channel_id: u16, queue_name: []const u8, message_count: u32, consumer_count: u32) !void {
@@ -189,7 +187,6 @@ pub const QueueHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Queue.DeclareOk sent to channel {} on connection {}: {s}", .{ channel_id, connection.id, queue_name });
     }
 
     pub fn handleQueueDelete(self: *QueueHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -265,8 +262,6 @@ pub const QueueHandler = struct {
         if (!no_wait) {
             try self.sendQueueDeleteOk(connection, channel_id, message_count);
         }
-
-        std.log.debug("Queue.Delete handled for connection {}, channel {}: {s}", .{ connection.id, channel_id, queue_name });
     }
 
     pub fn sendQueueDeleteOk(self: *QueueHandler, connection: *Connection, channel_id: u16, message_count: u32) !void {
@@ -289,7 +284,6 @@ pub const QueueHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Queue.DeleteOk sent to channel {} on connection {}", .{ channel_id, connection.id });
     }
 
     pub fn handleQueueBind(self: *QueueHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -431,8 +425,6 @@ pub const QueueHandler = struct {
         if (!no_wait) {
             try self.sendQueueBindOk(connection, channel_id);
         }
-
-        std.log.debug("Queue.Bind handled for connection {}, channel {}: {s} -> {s}", .{ connection.id, channel_id, exchange_name, queue_name });
     }
 
     pub fn sendQueueBindOk(self: *QueueHandler, connection: *Connection, channel_id: u16) !void {
@@ -452,7 +444,6 @@ pub const QueueHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Queue.BindOk sent to channel {} on connection {}", .{ channel_id, connection.id });
     }
 
     pub fn handleQueueUnbind(self: *QueueHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -580,8 +571,6 @@ pub const QueueHandler = struct {
 
         // Send Queue.UnbindOk
         try self.sendQueueUnbindOk(connection, channel_id);
-
-        std.log.debug("Queue.Unbind handled for connection {}, channel {}: {s} -/-> {s}", .{ connection.id, channel_id, exchange_name, queue_name });
     }
 
     pub fn sendQueueUnbindOk(self: *QueueHandler, connection: *Connection, channel_id: u16) !void {
@@ -601,7 +590,6 @@ pub const QueueHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Queue.UnbindOk sent to channel {} on connection {}", .{ channel_id, connection.id });
     }
 
     pub fn handleQueuePurge(self: *QueueHandler, connection: *Connection, channel_id: u16, payload: []const u8) !void {
@@ -674,8 +662,6 @@ pub const QueueHandler = struct {
         if (!no_wait) {
             try self.sendQueuePurgeOk(connection, channel_id, message_count);
         }
-
-        std.log.debug("Queue.Purge handled for connection {}, channel {}: {s} ({} messages)", .{ connection.id, channel_id, queue_name, message_count });
     }
 
     pub fn sendQueuePurgeOk(self: *QueueHandler, connection: *Connection, channel_id: u16, message_count: u32) !void {
@@ -698,7 +684,6 @@ pub const QueueHandler = struct {
         defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
-        std.log.debug("Queue.PurgeOk sent to channel {} on connection {}", .{ channel_id, connection.id });
     }
 };
 
