@@ -65,8 +65,7 @@ const BenchmarkSuite = struct {
 
         try self.results.append(result);
 
-        std.log.info("  Total time: {d:.2}ms, Avg: {d:.2}μs, Throughput: {d:.0} ops/sec, Memory: {} bytes",
-            .{ @as(f64, @floatFromInt(total_time_ns)) / 1_000_000.0, @as(f64, @floatFromInt(avg_time_ns)) / 1000.0, throughput, memory_used });
+        std.log.info("  Total time: {d:.2}ms, Avg: {d:.2}μs, Throughput: {d:.0} ops/sec, Memory: {} bytes", .{ @as(f64, @floatFromInt(total_time_ns)) / 1_000_000.0, @as(f64, @floatFromInt(avg_time_ns)) / 1000.0, throughput, memory_used });
     }
 
     pub fn printSummary(self: *const BenchmarkSuite) void {
@@ -77,9 +76,8 @@ const BenchmarkSuite = struct {
         for (self.results.items) |result| {
             const avg_time_us = @as(f64, @floatFromInt(result.avg_time_ns)) / 1000.0;
             const memory_mb = @as(f64, @floatFromInt(result.memory_used_bytes)) / (1024.0 * 1024.0);
-            
-            std.log.info("| {s:<30} | {d:>12} | {d:>9.2}μs | {d:>11.0} ops/s | {d:>9.2}MB |",
-                .{ result.name, result.iterations, avg_time_us, result.throughput_ops_per_sec, memory_mb });
+
+            std.log.info("| {s:<30} | {d:>12} | {d:>9.2}μs | {d:>11.0} ops/s | {d:>9.2}MB |", .{ result.name, result.iterations, avg_time_us, result.throughput_ops_per_sec, memory_mb });
         }
         std.log.info("|{s:-<32}|{s:-<14}|{s:-<14}|{s:-<17}|{s:-<14}|", .{ "", "", "", "", "" });
     }
@@ -112,7 +110,7 @@ pub fn main() !void {
 
 fn runMessageBenchmarks(suite: *BenchmarkSuite) !void {
     std.log.info("\n--- Message Benchmarks ---", .{});
-    
+
     try suite.runBenchmark("Message Creation", 100_000, MessageBenchmarks.benchmarkMessageCreation);
     try suite.runBenchmark("Message Serialization", 50_000, MessageBenchmarks.benchmarkMessageSerialization);
     try suite.runBenchmark("Message Deserialization", 50_000, MessageBenchmarks.benchmarkMessageDeserialization);
@@ -123,7 +121,7 @@ fn runMessageBenchmarks(suite: *BenchmarkSuite) !void {
 
 fn runQueueBenchmarks(suite: *BenchmarkSuite) !void {
     std.log.info("\n--- Queue Benchmarks ---", .{});
-    
+
     try suite.runBenchmark("Queue Publish", 100_000, QueueBenchmarks.benchmarkQueuePublish);
     try suite.runBenchmark("Queue Consume", 100_000, QueueBenchmarks.benchmarkQueueConsume);
     try suite.runBenchmark("Queue Acknowledge", 100_000, QueueBenchmarks.benchmarkQueueAcknowledge);
@@ -133,7 +131,7 @@ fn runQueueBenchmarks(suite: *BenchmarkSuite) !void {
 
 fn runExchangeBenchmarks(suite: *BenchmarkSuite) !void {
     std.log.info("\n--- Exchange Benchmarks ---", .{});
-    
+
     try suite.runBenchmark("Direct Exchange Routing", 100_000, ExchangeBenchmarks.benchmarkDirectExchangeRouting);
     try suite.runBenchmark("Fanout Exchange Routing", 50_000, ExchangeBenchmarks.benchmarkFanoutExchangeRouting);
     try suite.runBenchmark("Topic Exchange Routing", 25_000, ExchangeBenchmarks.benchmarkTopicExchangeRouting);
@@ -142,7 +140,7 @@ fn runExchangeBenchmarks(suite: *BenchmarkSuite) !void {
 
 fn runRoutingBenchmarks(suite: *BenchmarkSuite) !void {
     std.log.info("\n--- Routing Benchmarks ---", .{});
-    
+
     try suite.runBenchmark("Message Routing E2E", 50_000, RoutingBenchmarks.benchmarkEndToEndRouting);
     try suite.runBenchmark("Binding Operations", 25_000, RoutingBenchmarks.benchmarkBindingOperations);
     try suite.runBenchmark("Topic Pattern Matching", 100_000, RoutingBenchmarks.benchmarkTopicPatternMatching);
@@ -150,7 +148,7 @@ fn runRoutingBenchmarks(suite: *BenchmarkSuite) !void {
 
 fn runStorageBenchmarks(suite: *BenchmarkSuite) !void {
     std.log.info("\n--- Storage Benchmarks ---", .{});
-    
+
     try suite.runBenchmark("Message Storage Write", 25_000, StorageBenchmarks.benchmarkMessageStorageWrite);
     try suite.runBenchmark("Message Storage Read", 25_000, StorageBenchmarks.benchmarkMessageStorageRead);
     try suite.runBenchmark("Message Storage Batch Write", 5_000, StorageBenchmarks.benchmarkMessageStorageBatchWrite);
@@ -159,7 +157,7 @@ fn runStorageBenchmarks(suite: *BenchmarkSuite) !void {
 
 fn runConcurrencyBenchmarks(suite: *BenchmarkSuite) !void {
     std.log.info("\n--- Concurrency Benchmarks ---", .{});
-    
+
     try suite.runBenchmark("Concurrent Queue Access", 10_000, ConcurrencyBenchmarks.benchmarkConcurrentQueueAccess);
     try suite.runBenchmark("Concurrent Message Publish", 10_000, ConcurrencyBenchmarks.benchmarkConcurrentMessagePublish);
     try suite.runBenchmark("Concurrent Consumer Operations", 5_000, ConcurrencyBenchmarks.benchmarkConcurrentConsumerOperations);

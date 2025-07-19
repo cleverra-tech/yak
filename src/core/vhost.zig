@@ -11,6 +11,7 @@ pub const VirtualHost = struct {
     queues: std.HashMap([]const u8, *Queue, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     allocator: std.mem.Allocator,
     active: bool,
+    server_ref: ?*anyopaque, // Reference to the Server for cluster operations
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8) !VirtualHost {
         var vhost = VirtualHost{
@@ -19,6 +20,7 @@ pub const VirtualHost = struct {
             .queues = std.HashMap([]const u8, *Queue, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .allocator = allocator,
             .active = true,
+            .server_ref = null,
         };
 
         // Create default exchanges
@@ -289,6 +291,17 @@ pub const VirtualHost = struct {
             } else {
                 try queue.publish(message.*);
             }
+
+            // Replicate message to cluster if enabled
+            if (self.server_ref) |server_ptr| {
+                const Server = @import("server.zig").Server;
+                const server = @as(*Server, @ptrCast(@alignCast(server_ptr)));
+                if (server.cluster) |*cluster| {
+                    cluster.replicateMessage(self.name, queue_name, message) catch |err| {
+                        std.log.warn("Failed to replicate message to cluster: {}", .{err});
+                    };
+                }
+            }
         }
     }
 
@@ -374,22 +387,27 @@ pub const VirtualHost = struct {
     /// Apply compression to a message if it meets the criteria
     fn applyCompressionIfNeeded(self: *VirtualHost, message: *Message, exchange_name: []const u8) !void {
         _ = self;
-        
+
         // For now, use simple built-in compression logic
         // In a full implementation, this would read from the broker's compression configuration
         const threshold = Message.DEFAULT_COMPRESSION_THRESHOLD;
         const compression_type = CompressionType.gzip;
-        
+
         // Simple policy: compress large messages on specific exchanges
-        const should_compress = message.body.len >= threshold and 
-            !message.is_compressed and 
-            (std.mem.startsWith(u8, exchange_name, "amq.") or 
-             std.mem.eql(u8, exchange_name, "logs") or
-             std.mem.eql(u8, exchange_name, "events"));
-        
+        const should_compress = message.body.len >= threshold and
+            !message.is_compressed and
+            (std.mem.startsWith(u8, exchange_name, "amq.") or
+                std.mem.eql(u8, exchange_name, "logs") or
+                std.mem.eql(u8, exchange_name, "events"));
+
         if (should_compress) {
             try message.compressIfNeeded(compression_type, threshold);
         }
+    }
+
+    /// Set the server reference for cluster operations
+    pub fn setServerReference(self: *VirtualHost, server_ref: *anyopaque) void {
+        self.server_ref = server_ref;
     }
 };
 

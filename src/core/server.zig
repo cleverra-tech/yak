@@ -14,6 +14,7 @@ const MetricsHttpServer = @import("../metrics/http_server.zig").MetricsHttpServe
 const BrokerMetricsCollector = @import("../metrics/broker_collector.zig").BrokerMetricsCollector;
 const SslContext = @import("../network/ssl.zig").SslContext;
 const SslListener = @import("../network/ssl.zig").SslListener;
+const Cluster = @import("../cluster/cluster.zig").Cluster;
 
 // Context structure for CLI client thread
 const CliClientContext = struct {
@@ -62,6 +63,9 @@ pub const Server = struct {
     metrics_http_server: ?MetricsHttpServer,
     metrics_collector: ?BrokerMetricsCollector,
 
+    // Cluster components
+    cluster: ?Cluster,
+
     pub fn init(allocator: std.mem.Allocator, config: Config) !Server {
         const protocol_handler = ProtocolHandler.init(allocator);
 
@@ -86,6 +90,7 @@ pub const Server = struct {
             .metrics_registry = null,
             .metrics_http_server = null,
             .metrics_collector = null,
+            .cluster = null,
         };
 
         // Set up global server reference for persistence callback
@@ -99,6 +104,11 @@ pub const Server = struct {
 
         // Create default virtual host
         try server.createVirtualHost("/");
+        
+        // Set server reference for default virtual host for cluster operations
+        if (server.getVirtualHost("/")) |default_vhost| {
+            default_vhost.setServerReference(&server);
+        }
 
         // Initialize SSL context if enabled
         if (server.config.ssl.enabled) {
@@ -108,6 +118,11 @@ pub const Server = struct {
         // Initialize metrics if enabled
         if (server.config.metrics.enabled) {
             try server.initializeMetrics();
+        }
+
+        // Initialize cluster if enabled
+        if (server.config.cluster.enabled) {
+            try server.initializeCluster();
         }
 
         // Recover persistent state from storage
@@ -148,6 +163,11 @@ pub const Server = struct {
         }
         if (self.ssl_context) |*ssl_context| {
             ssl_context.deinit();
+        }
+
+        // Clean up cluster components
+        if (self.cluster) |*cluster| {
+            cluster.deinit();
         }
 
         // Clean up metrics components
@@ -193,6 +213,12 @@ pub const Server = struct {
         });
 
         self.running = true;
+
+        // Start cluster if enabled
+        if (self.cluster) |*cluster| {
+            const default_vhost = self.getVirtualHost("/").?;
+            try cluster.start(default_vhost);
+        }
 
         // Start accepting connections
         while (self.running and !self.shutdown_requested.load(.monotonic)) {
@@ -286,6 +312,12 @@ pub const Server = struct {
 
     pub fn stop(self: *Server) void {
         self.running = false;
+
+        // Stop cluster if enabled
+        if (self.cluster) |*cluster| {
+            cluster.stop();
+        }
+
         if (self.tcp_server) |*server| {
             server.deinit();
             self.tcp_server = null;
@@ -421,7 +453,7 @@ pub const Server = struct {
 
             // Basic command handling
             if (std.mem.eql(u8, command, "help")) {
-                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  metrics - Show server metrics\n  list queues [vhost] - List all queues in virtual host (default: /)\n  list exchanges [vhost] - List all exchanges in virtual host (default: /)\n  list connections - List all active client connections\n  list vhosts - List all virtual hosts\n  queue info <name> [vhost] - Show detailed information about a queue\n  queue declare <name> [--durable] [--exclusive] [--auto-delete] [vhost] - Create a new queue\n  queue delete <name> [--if-unused] [--if-empty] [vhost] - Delete a queue\n  queue purge <name> [vhost] - Remove all messages from a queue\n  exchange declare <name> <type> [--durable] [--auto-delete] [vhost] - Create a new exchange\n  exchange delete <name> [--if-unused] [vhost] - Delete an exchange\n  vhost create <name> - Create a new virtual host\n  vhost delete <name> - Delete a virtual host\n  vhost info <name> - Show detailed information about a virtual host\n  exit - Close connection\n";
+                const help_msg = "Available commands:\n  help - Show this help\n  status - Show server status\n  metrics - Show server metrics\n  cluster status - Show cluster status and node information\n  list queues [vhost] - List all queues in virtual host (default: /)\n  list exchanges [vhost] - List all exchanges in virtual host (default: /)\n  list connections - List all active client connections\n  list vhosts - List all virtual hosts\n  queue info <name> [vhost] - Show detailed information about a queue\n  queue declare <name> [--durable] [--exclusive] [--auto-delete] [vhost] - Create a new queue\n  queue delete <name> [--if-unused] [--if-empty] [vhost] - Delete a queue\n  queue purge <name> [vhost] - Remove all messages from a queue\n  exchange declare <name> <type> [--durable] [--auto-delete] [vhost] - Create a new exchange\n  exchange delete <name> [--if-unused] [vhost] - Delete an exchange\n  vhost create <name> - Create a new virtual host\n  vhost delete <name> - Delete a virtual host\n  vhost info <name> - Show detailed information about a virtual host\n  exit - Close connection\n";
                 try connection.stream.writeAll(help_msg);
             } else if (std.mem.startsWith(u8, command, "list queues")) {
                 try self.handleListQueuesCommand(connection, command);
@@ -451,6 +483,8 @@ pub const Server = struct {
                 try self.handleVHostInfoCommand(connection, command);
             } else if (std.mem.eql(u8, command, "metrics")) {
                 try self.handleMetricsCommand(connection, command);
+            } else if (std.mem.startsWith(u8, command, "cluster status")) {
+                try self.handleClusterStatusCommand(connection, command);
             } else if (std.mem.eql(u8, command, "status")) {
                 const status_msg = try std.fmt.allocPrint(self.allocator, "Server Status:\n  Running: {}\n  Connections: {}\n  Virtual Hosts: {}\n  Shutdown Requested: {}\n", .{
                     self.running,
@@ -1369,6 +1403,9 @@ pub const Server = struct {
         const owned_name = try self.allocator.dupe(u8, name);
         const vhost = try self.allocator.create(VirtualHost);
         vhost.* = try VirtualHost.init(self.allocator, owned_name);
+        
+        // Set server reference for cluster operations
+        vhost.setServerReference(self);
 
         try self.vhosts.put(owned_name, vhost);
         std.log.info("Virtual host created: {s}", .{name});
@@ -1756,6 +1793,52 @@ pub const Server = struct {
         try self.metrics_http_server.?.start();
 
         std.log.info("Metrics system initialized - HTTP server on {s}:{d}", .{ self.config.metrics.host, self.config.metrics.port });
+    }
+
+    /// Initialize cluster components
+    fn initializeCluster(self: *Server) !void {
+        // Initialize cluster
+        self.cluster = try Cluster.init(self.allocator, self.config.cluster);
+
+        std.log.info("Cluster system initialized - node {} on {s}:{d}", .{ self.config.cluster.node_id, self.config.cluster.bind_address, self.config.cluster.bind_port });
+    }
+
+    fn handleClusterStatusCommand(self: *Server, connection: std.net.Server.Connection, command: []const u8) !void {
+        _ = command; // No additional parameters needed for cluster status
+
+        if (self.cluster) |*cluster| {
+            const cluster_status = cluster.getClusterStatus();
+
+            const status_msg = try std.fmt.allocPrint(self.allocator,
+                \\Cluster Status:
+                \\  Enabled: {}
+                \\  Node Count: {}
+                \\  Leader Node: {}
+                \\  Is Leader: {}
+                \\  Active Connections: {}
+                \\  Local Node ID: {}
+                \\  Bind Address: {s}:{}
+                \\  Replication Factor: {}
+                \\  Auto Failover: {}
+                \\
+            , .{
+                cluster_status.enabled,
+                cluster_status.node_count,
+                cluster_status.leader_node orelse 0,
+                cluster_status.is_leader,
+                cluster_status.active_connections,
+                self.config.cluster.node_id,
+                self.config.cluster.bind_address,
+                self.config.cluster.bind_port,
+                self.config.cluster.replication_factor,
+                self.config.cluster.enable_auto_failover,
+            });
+            defer self.allocator.free(status_msg);
+            try connection.stream.writeAll(status_msg);
+        } else {
+            const no_cluster_msg = "Cluster support is disabled. Enable clustering in configuration to view cluster status.\n";
+            try connection.stream.writeAll(no_cluster_msg);
+        }
     }
 
     /// Get metrics registry for external access

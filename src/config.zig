@@ -11,6 +11,7 @@ pub const Config = struct {
     cli: CliConfig,
     metrics: MetricsConfig,
     compression: CompressionConfig,
+    cluster: ClusterConfig,
 
     const TcpConfig = struct {
         host: []const u8,
@@ -143,41 +144,53 @@ pub const Config = struct {
         auto_compress: bool, // Auto-compress messages over threshold
         whitelist_exchanges: [][]const u8, // Only compress messages from these exchanges
         blacklist_exchanges: [][]const u8, // Never compress messages from these exchanges
-        
+
         pub fn getCompressionType(self: *const CompressionConfig) CompressionType {
             if (!self.enabled) return .none;
-            
+
             if (std.mem.eql(u8, self.default_type, "gzip")) return .gzip;
             if (std.mem.eql(u8, self.default_type, "zlib")) return .zlib;
             return .none;
         }
-        
+
         pub fn shouldCompress(self: *const CompressionConfig, exchange: []const u8, body_size: usize) bool {
             if (!self.enabled or !self.auto_compress or body_size < self.threshold_bytes) {
                 return false;
             }
-            
+
             // Check blacklist first
             for (self.blacklist_exchanges) |blacklisted| {
                 if (std.mem.eql(u8, exchange, blacklisted)) {
                     return false;
                 }
             }
-            
+
             // If whitelist is empty, allow all (except blacklisted)
             if (self.whitelist_exchanges.len == 0) {
                 return true;
             }
-            
+
             // Check whitelist
             for (self.whitelist_exchanges) |whitelisted| {
                 if (std.mem.eql(u8, exchange, whitelisted)) {
                     return true;
                 }
             }
-            
+
             return false;
         }
+    };
+
+    pub const ClusterConfig = struct {
+        enabled: bool,
+        node_id: u64,
+        bind_address: []const u8,
+        bind_port: u16,
+        seed_nodes: [][]const u8,
+        heartbeat_interval_ms: u64,
+        failure_timeout_ms: u64,
+        replication_factor: u8,
+        enable_auto_failover: bool,
     };
 
     pub fn default(allocator: std.mem.Allocator) !Config {
@@ -259,6 +272,17 @@ pub const Config = struct {
                 .whitelist_exchanges = &[_][]const u8{}, // Empty means allow all
                 .blacklist_exchanges = &[_][]const u8{}, // Empty means block none
             },
+            .cluster = ClusterConfig{
+                .enabled = false,
+                .node_id = 1,
+                .bind_address = try allocator.dupe(u8, "127.0.0.1"),
+                .bind_port = 6672, // Different from AMQP port
+                .seed_nodes = &[_][]const u8{}, // Empty by default
+                .heartbeat_interval_ms = 5000, // 5 seconds
+                .failure_timeout_ms = 30000, // 30 seconds
+                .replication_factor = 2, // Replicate to 2 other nodes
+                .enable_auto_failover = true,
+            },
         };
     }
 
@@ -308,6 +332,20 @@ pub const Config = struct {
         allocator.free(self.auth.default_password);
         allocator.free(self.cli.socket_path);
         allocator.free(self.metrics.host);
+        allocator.free(self.compression.default_type);
+        for (self.compression.whitelist_exchanges) |exchange| {
+            allocator.free(exchange);
+        }
+        allocator.free(self.compression.whitelist_exchanges);
+        for (self.compression.blacklist_exchanges) |exchange| {
+            allocator.free(exchange);
+        }
+        allocator.free(self.compression.blacklist_exchanges);
+        allocator.free(self.cluster.bind_address);
+        for (self.cluster.seed_nodes) |node| {
+            allocator.free(node);
+        }
+        allocator.free(self.cluster.seed_nodes);
     }
 
     fn cloneConfig(allocator: std.mem.Allocator, config: Config) !Config {
@@ -379,6 +417,17 @@ pub const Config = struct {
                 .auto_compress = config.compression.auto_compress,
                 .whitelist_exchanges = try cloneStringArray(allocator, config.compression.whitelist_exchanges),
                 .blacklist_exchanges = try cloneStringArray(allocator, config.compression.blacklist_exchanges),
+            },
+            .cluster = ClusterConfig{
+                .enabled = config.cluster.enabled,
+                .node_id = config.cluster.node_id,
+                .bind_address = try allocator.dupe(u8, config.cluster.bind_address),
+                .bind_port = config.cluster.bind_port,
+                .seed_nodes = try cloneStringArray(allocator, config.cluster.seed_nodes),
+                .heartbeat_interval_ms = config.cluster.heartbeat_interval_ms,
+                .failure_timeout_ms = config.cluster.failure_timeout_ms,
+                .replication_factor = config.cluster.replication_factor,
+                .enable_auto_failover = config.cluster.enable_auto_failover,
             },
         };
     }
