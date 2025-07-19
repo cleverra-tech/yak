@@ -460,23 +460,23 @@ pub const BasicHandler = struct {
     }
 
     pub fn sendBasicGetEmpty(self: *BasicHandler, connection: *Connection, channel_id: u16) !void {
-        var payload = std.ArrayList(u8).init(self.allocator);
-        defer payload.deinit();
+        _ = self; // BasicHandler not needed for this method
+
+        // Fixed-size payload: Class ID (2) + Method ID (2) + Cluster ID (1) = 5 bytes
+        var payload: [5]u8 = undefined;
 
         // Class ID (Basic = 60)
-        try payload.appendSlice(&std.mem.toBytes(@as(u16, 60)));
+        std.mem.writeInt(u16, payload[0..2], 60, .little);
         // Method ID (GetEmpty = 72)
-        try payload.appendSlice(&std.mem.toBytes(@as(u16, 72)));
-
+        std.mem.writeInt(u16, payload[2..4], 72, .little);
         // Cluster ID (short string) - empty
-        try payload.append(0);
+        payload[4] = 0;
 
         const frame = Frame{
             .frame_type = .method,
             .channel_id = channel_id,
-            .payload = try self.allocator.dupe(u8, payload.items),
+            .payload = &payload,
         };
-        defer self.allocator.free(frame.payload);
 
         try connection.sendFrame(frame);
     }
