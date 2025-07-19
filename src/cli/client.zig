@@ -57,7 +57,7 @@ const CliClient = struct {
 
             if (bytes_read == 0) {
                 // EOF reached (Ctrl+D)
-                std.debug.print("\nGoodbye!\n", .{});
+                std.debug.print("Goodbye!\n", .{});
                 break;
             }
 
@@ -81,7 +81,7 @@ const CliClient = struct {
 
             // Send command to server
             const response = self.sendCommand(command) catch |err| {
-                std.debug.print("Error sending command: {}\n", .{err});
+                std.log.err("Error sending command: {}", .{err});
                 continue;
             };
             defer self.allocator.free(response);
@@ -157,7 +157,7 @@ pub fn main() !void {
                 socket_path = args[i + 1];
                 i += 1;
             } else {
-                std.debug.print("Error: --socket requires a path\n", .{});
+                std.log.err("Error: --socket requires a path", .{});
                 return;
             }
         } else if (std.mem.eql(u8, args[i], "--interactive") or std.mem.eql(u8, args[i], "-i")) {
@@ -171,8 +171,8 @@ pub fn main() !void {
 
     // Connect to CLI server
     client.connect() catch |err| {
-        std.debug.print("Failed to connect to Yak CLI server at {s}: {}\n", .{ socket_path, err });
-        std.debug.print("Make sure the Yak message broker is running with CLI enabled.\n", .{});
+        std.log.err("Failed to connect to Yak CLI server at {s}: {}", .{ socket_path, err });
+        std.log.err("Make sure the Yak message broker is running with CLI enabled.", .{});
         return;
     };
     defer client.disconnect();
