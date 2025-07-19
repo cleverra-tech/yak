@@ -158,14 +158,16 @@ pub const VirtualHost = struct {
         const queue = self.queues.get(name) orelse return error.QueueNotFound;
 
         if (if_unused and queue.consumers.items.len > 0) {
+            const consumer_count = queue.consumers.items.len;
+            std.log.warn("Cannot delete queue '{s}': queue in use ({} consumers)", .{ name, consumer_count });
             return error.QueueInUse;
         }
 
-        if (if_empty and queue.getMessageCount() > 0) {
+        const message_count = queue.getMessageCount();
+        if (if_empty and message_count > 0) {
+            std.log.warn("Cannot delete queue '{s}': queue not empty ({} messages)", .{ name, message_count });
             return error.QueueNotEmpty;
         }
-
-        const message_count = queue.getMessageCount();
 
         // Remove all bindings for this queue
         var exchange_iterator = self.exchanges.iterator();
